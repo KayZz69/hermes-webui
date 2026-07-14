@@ -3,6 +3,7 @@ Hermes Web UI -- Route handlers for GET and POST endpoints.
 Extracted from server.py (Sprint 11) so server.py is a thin shell.
 """
 
+import copy
 import html as _html
 import json
 import logging
@@ -1265,6 +1266,51 @@ def handle_post(handler, parsed) -> bool:
         # different profiles never clobber each other via the process-level global.
         s = new_session(workspace=workspace, model=body.get("model"), profile=body.get("profile") or None)
         return j(handler, {"session": s.compact() | {"messages": s.messages}})
+
+    if parsed.path == "/api/session/branch":
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        if body.get("keep_count") is None:
+            return bad(handler, "Missing required field(s): keep_count")
+        try:
+            source = get_session(body["session_id"])
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        try:
+            keep = int(body["keep_count"])
+        except (TypeError, ValueError):
+            return bad(handler, "keep_count must be an integer")
+        if keep < 0 or keep > len(source.messages):
+            return bad(handler, "keep_count is out of range")
+        # Editing an older message must not destroy the original transcript.
+        # Create a WebUI-native branch containing the history before the edited
+        # message; the frontend sends the replacement text into this new session.
+        with _get_session_agent_lock(body["session_id"]):
+            branch = new_session(
+                workspace=source.workspace,
+                model=source.model,
+                profile=source.profile,
+            )
+            branch.title = f"{source.title or 'Untitled'} — edited branch"[:80]
+            branch.project_id = source.project_id
+            branch.personality = source.personality
+            branch.messages = copy.deepcopy(source.messages[:keep])
+            branch.tool_calls = [
+                copy.deepcopy(call)
+                for message in branch.messages
+                for call in (message.get("tool_calls") or [])
+                if isinstance(call, dict)
+            ]
+            branch.save()
+        return j(
+            handler,
+            {"ok": True, "session": branch.compact() | {
+                "messages": branch.messages,
+                "tool_calls": branch.tool_calls,
+            }},
+        )
 
     if parsed.path == "/api/default-model":
         try:

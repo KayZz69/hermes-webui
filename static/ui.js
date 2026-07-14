@@ -3057,8 +3057,9 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-send').onclick = async () => {
     const newText = ta.value.trim();
     if(!newText) return;
-    if(row.dataset.olderUser && !confirm('Editing this older message will discard all later messages and continue from the edited message. Continue?')) return;
-    await submitEdit(msgIdx, newText);
+    const branchEdit=Boolean(row.dataset.olderUser);
+    if(branchEdit && !confirm('Editing this older message will create a new conversation branch. The original conversation and all later messages will be preserved. Continue?')) return;
+    await submitEdit(msgIdx, newText, branchEdit);
   };
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
 
@@ -3081,17 +3082,27 @@ function autoResizeTextarea(ta) {
   ta.style.height = Math.min(ta.scrollHeight, 300) + 'px';
 }
 
-async function submitEdit(msgIdx, newText) {
+async function submitEdit(msgIdx, newText, branchEdit=false) {
   if(!S.session || S.busy) return;
-  // Truncate session at msgIdx (keep messages before the edited one)
-  // then re-send the edited text
+  // Older-message edits branch so the original transcript remains intact.
+  // Editing the latest user turn keeps the existing retry-style behavior.
   try {
-    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
-      session_id: S.session.session_id,
-      keep_count: msgIdx  // keep messages[0..msgIdx-1], discard from msgIdx onward
-    })});
-    S.messages = S.messages.slice(0, msgIdx);
-    renderMessages();
+    if(branchEdit){
+      const data=await api('/api/session/branch', {method:'POST', body:JSON.stringify({
+        session_id: S.session.session_id,
+        keep_count: msgIdx
+      })});
+      if(!data||!data.session) throw new Error('Failed to create edit branch');
+      await loadSession(data.session.session_id);
+      await renderSessionList();
+    }else{
+      await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
+        session_id: S.session.session_id,
+        keep_count: msgIdx
+      })});
+      S.messages = S.messages.slice(0, msgIdx);
+      renderMessages();
+    }
     // Now send the edited message as a new chat
     $('msg').value = newText;
     await send();
