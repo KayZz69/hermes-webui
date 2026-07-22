@@ -914,14 +914,28 @@ function startGatewaySSE(){
           // S.busy check prevents stomping on an in-progress WebUI response.
           // is_cli_session check ensures we only poll import_cli for CLI-originated sessions.
           if(S.session && !S.busy && S.session.is_cli_session){
-            const changedIds = new Set((data.sessions||[]).map(s=>s.session_id));
-            if(changedIds.has(S.session.session_id)){
+            const changedSessions = data.sessions||[];
+            const activeAgentId = S.session.agent_session_id||S.session.session_id;
+            const activeRootId = S.session.agent_lineage_root_id||S.session.session_id;
+            const activeChanged = changedSessions.some(s=>
+              s.session_id===activeAgentId || s.agent_lineage_root_id===activeRootId
+            );
+            if(activeChanged){
               // Capture active session ID before async fetch — race guard.
               // If the user switches sessions while the fetch is in-flight, discard the result.
               const activeSid = S.session.session_id;
-              api('/api/session/import_cli',{method:'POST',body:JSON.stringify({session_id:activeSid})})
+              api('/api/session/import_cli',{method:'POST',body:JSON.stringify({
+                session_id:activeSid,
+                agent_session_id:S.session.agent_session_id||activeSid,
+                agent_lineage_root_id:S.session.agent_lineage_root_id||activeSid,
+                profile:S.session.profile||'default'
+              })})
                 .then(res=>{
                   if(!S.session || S.session.session_id !== activeSid) return;
+                  if(res && res.conflict){
+                    showToast('Agent sync conflict: local WebUI history was preserved');
+                    return;
+                  }
                   if(res && res.session && Array.isArray(res.session.messages)){
                     const prev = S.messages.length;
                     S.messages = res.session.messages.filter(m=>m&&m.role);
@@ -1113,7 +1127,7 @@ function renderSessionListFromCache(){
   // Filter by active profile (unless "All profiles" is toggled on)
   // Server backfills profile='default' for legacy sessions, so every session has a profile.
   // Show only sessions tagged to the active profile; 'All profiles' toggle overrides.
-  const profileFiltered=_showAllProfiles?withMessages:withMessages.filter(s=>s.is_cli_session||s.profile===S.activeProfile);
+  const profileFiltered=_showAllProfiles?withMessages:withMessages.filter(s=>s.profile===S.activeProfile);
   // Filter by active project
   const projectFiltered=_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered;
   // Filter archived unless toggle is on
@@ -1443,7 +1457,12 @@ function renderSessionListFromCache(){
         // For CLI sessions, import into WebUI store first (idempotent)
         if(s.is_cli_session){
           try{
-            await api('/api/session/import_cli',{method:'POST',body:JSON.stringify({session_id:s.session_id})});
+            await api('/api/session/import_cli',{method:'POST',body:JSON.stringify({
+              session_id:s.session_id,
+              agent_session_id:s.agent_session_id||s.session_id,
+              agent_lineage_root_id:s.agent_lineage_root_id||s.session_id,
+              profile:s.profile||'default'
+            })});
           }catch(e){ /* import failed -- fall through to read-only view */ }
         }
         await loadSession(s.session_id);renderSessionListFromCache();

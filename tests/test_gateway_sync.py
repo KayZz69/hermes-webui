@@ -910,7 +910,8 @@ def test_imported_gateway_session_stays_linked_to_newer_agent_state():
         projected = matches[0]
         assert projected.get('is_cli_session') is True, projected
         assert projected.get('source_tag') == 'telegram', projected
-        assert projected.get('message_count') == 4, projected
+        assert projected.get('message_count') == 2, projected
+        assert projected.get('agent_remote_message_count') == 4, projected
         assert projected.get('updated_at', 0) >= latest_at, projected
 
         refreshed, refreshed_status = post('/api/session/import_cli', {'session_id': sid})
@@ -937,8 +938,8 @@ def test_imported_gateway_session_stays_linked_to_newer_agent_state():
 
 
 def test_imported_gateway_refresh_never_overwrites_diverged_webui_messages():
-    """A hybrid sidecar is preserved when it is no longer an Agent prefix."""
-    from api.models import Session
+    """A hybrid sidecar is preserved when it differs from its sync watermark."""
+    from api.models import Session, get_cli_session_messages, session_messages_hash
 
     conn = _ensure_state_db()
     sid = 'gw_import_diverged_projection_001'
@@ -950,14 +951,24 @@ def test_imported_gateway_refresh_never_overwrites_diverged_webui_messages():
             title='Diverged imported Telegram session',
             message_count=2,
         )
-        post('/api/settings', {'show_cli_sessions': True})
-        imported, imported_status = post('/api/session/import_cli', {'session_id': sid})
-        assert imported_status == 200, imported
-
-        local = Session.load(sid)
-        assert local is not None
-        local.messages.append({'role': 'user', 'content': 'WebUI-only branch message'})
+        original_messages = get_cli_session_messages(sid)
+        assert len(original_messages) == 2
+        local = Session(
+            session_id=sid,
+            title='Diverged imported Telegram session',
+            messages=original_messages + [
+                {'role': 'user', 'content': 'WebUI-only branch message'}
+            ],
+            profile='default',
+            is_cli_session=True,
+            source_tag='telegram',
+            agent_session_id=sid,
+            agent_lineage_root_id=sid,
+            agent_sync_hash=session_messages_hash(original_messages),
+            agent_sync_message_count=len(original_messages),
+        )
         local.save(touch_updated_at=False)
+        post('/api/settings', {'show_cli_sessions': True})
 
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
@@ -968,6 +979,7 @@ def test_imported_gateway_refresh_never_overwrites_diverged_webui_messages():
 
         refreshed, refreshed_status = post('/api/session/import_cli', {'session_id': sid})
         assert refreshed_status == 200, refreshed
+        assert refreshed.get('conflict') is True, refreshed
         contents = [m.get('content') for m in refreshed['session']['messages']]
         assert contents[-1] == 'WebUI-only branch message', contents
         assert 'Different Telegram continuation' not in contents
@@ -983,6 +995,289 @@ def test_imported_gateway_refresh_never_overwrites_diverged_webui_messages():
         except Exception:
             pass
         post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_imported_cache_accepts_same_length_corrections_and_authoritative_shrink():
+    """An unchanged cache may follow corrected or shortened Agent history."""
+    conn = _ensure_state_db()
+    sid = 'gw_import_rewrite_projection_001'
+    try:
+        _insert_gateway_session(conn, session_id=sid, source='telegram', message_count=2)
+        post('/api/settings', {'show_cli_sessions': True})
+        imported, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 200, imported
+
+        conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND role = 'assistant'",
+            ('Corrected Agent response', sid),
+        )
+        conn.commit()
+        corrected, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 200, corrected
+        assert corrected.get('conflict') is False
+        assert corrected['session']['messages'][-1]['content'] == 'Corrected Agent response'
+
+        conn.execute("DELETE FROM messages WHERE session_id = ? AND role = 'assistant'", (sid,))
+        conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", (sid,))
+        conn.commit()
+        shrunk, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 200, shrunk
+        assert shrunk.get('conflict') is False
+        assert len(shrunk['session']['messages']) == 1
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        try:
+            post('/api/session/delete', {'session_id': sid})
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_compression_rotation_preserves_prior_visible_history():
+    """Moving to a new Agent segment must append, never erase, earlier turns."""
+    conn = _ensure_state_db()
+    root_sid = 'gw_compression_preserve_root'
+    tip_sid = 'gw_compression_preserve_tip'
+    boundary = time.time() + 5
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=root_sid,
+            source='telegram',
+            title='Compression history',
+            started_at=boundary - 100,
+            message_count=2,
+        )
+        post('/api/settings', {'show_cli_sessions': True})
+        imported, status = post('/api/session/import_cli', {'session_id': root_sid})
+        assert status == 200, imported
+        original = list(imported['session']['messages'])
+
+        conn.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+            (boundary, root_sid),
+        )
+        _insert_agent_session_row(
+            conn,
+            tip_sid,
+            source='telegram',
+            title='Compression tip',
+            started_at=boundary + 1,
+            parent_session_id=root_sid,
+            messages=2,
+        )
+        conn.commit()
+
+        rotated, status = post('/api/session/import_cli', {'session_id': root_sid})
+        assert status == 200, rotated
+        assert rotated.get('conflict') is False
+        assert rotated['session']['messages'][:len(original)] == original
+        assert len(rotated['session']['messages']) == len(original) + 2
+        assert rotated['session']['agent_session_id'] == tip_sid
+        assert rotated['session']['agent_preserved_prefix_count'] == len(original)
+
+        conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND role = 'assistant'",
+            ('Corrected compressed response', tip_sid),
+        )
+        conn.commit()
+        corrected, status = post('/api/session/import_cli', {'session_id': root_sid})
+        assert status == 200, corrected
+        assert corrected['session']['messages'][:len(original)] == original
+        assert len(corrected['session']['messages']) == len(original) + 2
+        assert corrected['session']['messages'][-1]['content'] == 'Corrected compressed response'
+    finally:
+        try:
+            _remove_test_sessions(conn, root_sid, tip_sid)
+            conn.close()
+        except Exception:
+            pass
+        try:
+            post('/api/session/delete', {'session_id': root_sid})
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_legacy_import_marker_survives_metadata_only_load(cleanup_test_sessions):
+    """Old sidecars stored provenance after messages; deep links must recover it."""
+    from api.models import Session
+
+    sid = 'gw_legacy_metadata_projection_001'
+    cleanup_test_sessions.append(sid)
+    session = Session(
+        session_id=sid,
+        title='Legacy imported session',
+        messages=[{'role': 'user', 'content': 'legacy'}],
+        is_cli_session=True,
+        source_tag='telegram',
+    )
+    session.save(touch_updated_at=False)
+    path = session.path
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    marker = payload.pop('is_cli_session')
+    source = payload.pop('source_tag')
+    messages = payload.pop('messages')
+    tool_calls = payload.pop('tool_calls')
+    legacy_payload = {**payload, 'messages': messages, 'tool_calls': tool_calls,
+                      'is_cli_session': marker, 'source_tag': source}
+    path.write_text(json.dumps(legacy_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    metadata = Session.load_metadata_only(sid)
+    assert metadata is not None
+    assert metadata.is_cli_session is True
+    assert metadata.source_tag == 'telegram'
+
+
+def test_sibling_compression_continuations_remain_visible():
+    from api.agent_sessions import _project_agent_session_rows
+
+    root = {
+        'id': 'root', 'started_at': 10, 'ended_at': 20,
+        'end_reason': 'compression', 'actual_message_count': 2,
+        'last_activity': 19, 'source': 'telegram',
+    }
+    older_branch = {
+        'id': 'branch_a', 'parent_session_id': 'root', 'started_at': 21,
+        'actual_message_count': 2, 'last_activity': 22, 'source': 'telegram',
+    }
+    canonical_tip = {
+        'id': 'branch_b', 'parent_session_id': 'root', 'started_at': 23,
+        'actual_message_count': 2, 'last_activity': 24, 'source': 'telegram',
+    }
+    projected = _project_agent_session_rows([root, older_branch, canonical_tip])
+    assert {row['id'] for row in projected} == {'branch_a', 'branch_b'}
+    canonical = next(row for row in projected if row['id'] == 'branch_b')
+    assert canonical['_lineage_root_id'] == 'root'
+
+
+def test_equal_timestamp_agent_messages_have_deterministic_id_order():
+    from api.agent_sessions import read_agent_session_snapshot
+
+    conn = _ensure_state_db()
+    sid = 'gw_equal_timestamp_order_001'
+    ts = time.time()
+    try:
+        _insert_agent_session_row(
+            conn, sid, source='telegram', title='Equal timestamps',
+            started_at=ts - 1, messages=0,
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, 'user', 'first insertion', ts),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, 'assistant', 'second insertion', ts),
+        )
+        conn.commit()
+        snapshot = read_agent_session_snapshot(pathlib.Path(os.environ['HERMES_HOME']) / 'state.db', sid)
+        assert [m['content'] for m in snapshot['messages']] == [
+            'first insertion', 'second insertion'
+        ]
+    finally:
+        _remove_test_sessions(conn, sid)
+        conn.close()
+
+
+def test_projection_is_profile_safe_and_follows_compression_lineage():
+    from api.models import merge_imported_agent_session_projections
+
+    local = {
+        'session_id': 'root_sidecar', 'profile': 'default', 'is_cli_session': True,
+        'agent_lineage_root_id': 'root_agent', 'message_count': 2,
+        'updated_at': 100, 'last_message_at': 100,
+    }
+    tip = {
+        'session_id': 'tip_agent', 'profile': 'default', 'is_cli_session': True,
+        'agent_lineage_root_id': 'root_agent', 'message_count': 4,
+        'updated_at': 300, 'last_message_at': 300, 'source_tag': 'telegram',
+    }
+    merged = merge_imported_agent_session_projections([local], [tip])
+    assert len(merged) == 1
+    assert merged[0]['session_id'] == 'root_sidecar'
+    assert merged[0]['agent_session_id'] == 'tip_agent'
+    assert merged[0]['message_count'] == 2
+    assert merged[0]['agent_remote_message_count'] == 4
+    assert merged[0]['last_message_at'] == 300
+
+    wrong_profile = {**tip, 'session_id': 'root_sidecar', 'profile': 'work', 'message_count': 99}
+    isolated = merge_imported_agent_session_projections([local], [wrong_profile])
+    assert len(isolated) == 2
+    assert isolated[0] == local
+    work_row = isolated[1]
+    assert work_row['profile'] == 'work'
+    assert work_row['agent_session_id'] == 'root_sidecar'
+    assert work_row['session_id'] != 'root_sidecar'
+    assert work_row['session_id'].startswith('agent_')
+
+
+def test_legacy_cache_accepts_exact_ordered_subsequence_but_not_local_branch():
+    from api.models import session_messages_are_ordered_subsequence
+
+    first = {'role': 'user', 'content': 'same', 'timestamp': 1}
+    second = {'role': 'assistant', 'content': 'answer', 'timestamp': 2}
+    authoritative = [first, dict(first), second]
+    assert session_messages_are_ordered_subsequence([first, second], authoritative)
+    assert not session_messages_are_ordered_subsequence(
+        [first, {'role': 'user', 'content': 'WebUI-only', 'timestamp': 1.5}],
+        authoritative,
+    )
+
+
+def test_missing_named_profile_fails_closed_without_touching_sidecar(cleanup_test_sessions):
+    """A deleted profile must never fall back to a same-ID default transcript."""
+    from api.models import Session, session_messages_hash
+
+    sid = 'gw_missing_profile_fail_closed_001'
+    cleanup_test_sessions.append(sid)
+    local_messages = [{'role': 'user', 'content': 'Retired profile only copy'}]
+    local = Session(
+        session_id=sid,
+        title='Retired profile cache',
+        messages=local_messages,
+        profile='retired-profile-that-does-not-exist',
+        is_cli_session=True,
+        source_tag='telegram',
+        agent_session_id=sid,
+        agent_lineage_root_id=sid,
+        agent_sync_hash=session_messages_hash(local_messages),
+        agent_sync_message_count=1,
+    )
+    local.save(touch_updated_at=False)
+
+    conn = _ensure_state_db()
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Different default-profile transcript',
+            message_count=2,
+        )
+        result, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 404, result
+        reloaded = Session.load(sid)
+        assert reloaded is not None
+        assert reloaded.profile == 'retired-profile-that-does-not-exist'
+        assert reloaded.messages == local_messages
+        assert reloaded.agent_sync_conflict is False
+    finally:
+        _remove_test_sessions(conn, sid)
+        conn.close()
+
+
+def test_frontend_filters_imported_sessions_by_profile_and_tracks_rotated_tip():
+    source = (REPO_ROOT / 'static' / 'sessions.js').read_text(encoding='utf-8')
+    assert 'withMessages.filter(s=>s.profile===S.activeProfile)' in source
+    assert 's.is_cli_session||s.profile===S.activeProfile' not in source
+    assert 's.agent_lineage_root_id===activeRootId' in source
+    assert "profile:s.profile||'default'" in source
+    assert 'Agent sync conflict: local WebUI history was preserved' in source
 
 
 

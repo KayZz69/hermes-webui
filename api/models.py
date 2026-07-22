@@ -1,5 +1,6 @@
 """Hermes Web UI -- Session model and in-memory session store."""
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from api.config import (
     get_effective_default_model, _get_session_agent_lock,
 )
 from api.workspace import get_last_workspace
-from api.agent_sessions import read_importable_agent_session_rows
+from api.agent_sessions import read_agent_session_snapshot, read_importable_agent_session_rows
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +320,12 @@ class Session:
                  compression_anchor_message_key=None,
                  is_cli_session: bool=False,
                  source_tag: str | None=None,
+                 agent_session_id: str | None=None,
+                 agent_lineage_root_id: str | None=None,
+                 agent_sync_hash: str | None=None,
+                 agent_sync_message_count: int | None=None,
+                 agent_sync_conflict: bool=False,
+                 agent_preserved_prefix_count: int=0,
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
@@ -344,6 +351,12 @@ class Session:
         self.compression_anchor_message_key = compression_anchor_message_key
         self.is_cli_session = bool(is_cli_session)
         self.source_tag = source_tag or None
+        self.agent_session_id = agent_session_id or None
+        self.agent_lineage_root_id = agent_lineage_root_id or None
+        self.agent_sync_hash = agent_sync_hash or None
+        self.agent_sync_message_count = agent_sync_message_count
+        self.agent_sync_conflict = bool(agent_sync_conflict)
+        self.agent_preserved_prefix_count = max(0, int(agent_preserved_prefix_count or 0))
         self._metadata_message_count = None
 
     @property
@@ -364,6 +377,9 @@ class Session:
             'pending_user_message', 'pending_attachments', 'pending_started_at',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'is_cli_session', 'source_tag',
+            'agent_session_id', 'agent_lineage_root_id', 'agent_sync_hash',
+            'agent_sync_message_count', 'agent_sync_conflict',
+            'agent_preserved_prefix_count',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
         meta['messages'] = self.messages
@@ -421,6 +437,13 @@ class Session:
             needed = {'session_id', 'title', 'created_at', 'updated_at'}
             if not needed.issubset(parsed.keys()):
                 return cls.load(sid)
+            if 'is_cli_session' not in parsed:
+                # Legacy importers wrote provenance after the messages array.
+                # Read the full sidecar once so metadata-only deep links retain
+                # their Agent identity before the next normal save migrates it.
+                legacy = cls.load(sid)
+                if legacy and legacy.is_cli_session:
+                    return legacy
             parsed['messages'] = []
             parsed['tool_calls'] = []
             session = cls(**parsed)
@@ -457,6 +480,11 @@ class Session:
             'compression_anchor_message_key': self.compression_anchor_message_key,
             'is_cli_session': self.is_cli_session,
             'source_tag': self.source_tag,
+            'agent_session_id': self.agent_session_id,
+            'agent_lineage_root_id': self.agent_lineage_root_id,
+            'agent_sync_message_count': self.agent_sync_message_count,
+            'agent_sync_conflict': self.agent_sync_conflict,
+            'agent_preserved_prefix_count': self.agent_preserved_prefix_count,
             'active_stream_id': self.active_stream_id,
             'is_streaming': _is_streaming_session(
                 self.active_stream_id, active_stream_ids
@@ -474,6 +502,24 @@ def _get_profile_home(profile) -> Path:
         return Path(get_hermes_home_for_profile(profile))
     except ImportError:
         return Path(os.environ.get('HERMES_HOME') or '~/.hermes').expanduser()
+
+
+def _get_agent_profile_home_strict(profile) -> Path | None:
+    """Resolve Agent state without allowing named profiles to fall back.
+
+    ``get_hermes_home_for_profile`` intentionally falls back to the default
+    home for missing/invalid names. That is useful for general UI operations,
+    but unsafe for authoritative transcript reads because raw session IDs may
+    exist in multiple profiles.
+    """
+    requested = profile or 'default'
+    home = _get_profile_home(requested).expanduser().resolve()
+    if requested == 'default':
+        return home
+    default_home = _get_profile_home('default').expanduser().resolve()
+    if home == default_home or not home.is_dir():
+        return None
+    return home
 
 
 def _apply_core_sync_or_error_marker(
@@ -733,35 +779,71 @@ def _hide_from_default_sidebar(session: dict) -> bool:
     return source == 'cron' or sid.startswith('cron_')
 
 
-def merge_imported_agent_session_projections(webui_sessions: list, agent_sessions: list) -> list:
-    """Merge Agent metadata into imported WebUI caches without mutating transcripts.
+def _agent_projection_cache_id(profile: str, agent_session_id: str) -> str:
+    """Return a stable sidecar ID for a profile-scoped Agent projection."""
+    key = f"{profile}\0{agent_session_id}".encode('utf-8')
+    return f"agent_{hashlib.sha256(key).hexdigest()[:24]}"
 
-    Native WebUI sessions remain authoritative for same-ID collisions. A local
-    sidecar is treated as an Agent cache only when it carries the durable
-    ``is_cli_session`` marker. For those rows, retain WebUI-only organization
-    fields and titles while surfacing newer Agent activity/count metadata.
+
+def merge_imported_agent_session_projections(webui_sessions: list, agent_sessions: list) -> list:
+    """Merge Agent activity into imported caches without mutating transcripts.
+
+    Matching is profile-aware and follows compression lineage. Native same-ID
+    sidecars suppress Agent rows rather than risking cross-profile overwrite.
+    Remote message counts stay separate until a locked transcript refresh proves
+    that the local sidecar still matches its last synchronized baseline.
     """
-    agent_by_id = {s.get('session_id'): s for s in agent_sessions if s.get('session_id')}
+    agent_by_id = {
+        (s.get('profile') or 'default', s.get('session_id')): s
+        for s in agent_sessions if s.get('session_id')
+    }
+    agent_by_root = {
+        (s.get('profile') or 'default', s.get('agent_lineage_root_id')): s
+        for s in agent_sessions if s.get('agent_lineage_root_id')
+    }
     merged = []
-    webui_ids = set()
+    webui_ids = {s.get('session_id') for s in webui_sessions}
+    matched_agent_ids = set()
+
     for local in webui_sessions:
         sid = local.get('session_id')
-        webui_ids.add(sid)
-        agent = agent_by_id.get(sid)
-        if not agent or not local.get('is_cli_session'):
+        profile = local.get('profile') or 'default'
+        root_id = local.get('agent_lineage_root_id') or sid
+        agent = None
+        if local.get('is_cli_session'):
+            agent = agent_by_id.get((profile, sid)) or agent_by_root.get((profile, root_id))
+        if not agent:
             merged.append(local)
             continue
 
+        matched_agent_ids.add((profile, agent.get('session_id')))
         projected = dict(local)
         projected['is_cli_session'] = True
         projected['source_tag'] = agent.get('source_tag') or projected.get('source_tag')
-        for field in ('message_count', 'updated_at', 'last_message_at'):
-            values = [v for v in (projected.get(field), agent.get(field)) if v is not None]
-            if values:
-                projected[field] = max(values)
+        projected['agent_session_id'] = agent.get('session_id')
+        projected['agent_lineage_root_id'] = agent.get('agent_lineage_root_id') or root_id
+        projected['agent_remote_message_count'] = agent.get('message_count')
+        remote_activity = agent.get('last_message_at') or agent.get('updated_at')
+        if remote_activity is not None:
+            projected['updated_at'] = max(projected.get('updated_at') or 0, remote_activity)
+            projected['last_message_at'] = max(
+                projected.get('last_message_at') or 0,
+                remote_activity,
+            )
         merged.append(projected)
 
-    merged.extend(s for s in agent_sessions if s.get('session_id') not in webui_ids)
+    for agent in agent_sessions:
+        raw_sid = agent.get('session_id')
+        profile = agent.get('profile') or 'default'
+        if not raw_sid or (profile, raw_sid) in matched_agent_ids:
+            continue
+        projected = dict(agent)
+        projected['agent_session_id'] = raw_sid
+        # Named profiles always receive a namespaced cache ID. Default-profile
+        # rows retain legacy IDs unless that would collide with a native sidecar.
+        if profile != 'default' or raw_sid in webui_ids:
+            projected['session_id'] = _agent_projection_cache_id(profile, raw_sid)
+        merged.append(projected)
     return merged
 
 
@@ -858,6 +940,36 @@ def title_from(messages, fallback: str='Untitled'):
     return fallback
 
 
+def session_messages_hash(messages: list) -> str:
+    """Stable digest used to prove that an imported cache was not edited locally."""
+    payload = json.dumps(
+        messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+def session_messages_are_ordered_subsequence(cached: list, authoritative: list) -> bool:
+    """Prove every cached message exists unchanged and in order remotely.
+
+    Legacy Agent stores can contain duplicate records inserted during migration
+    or replay. Exact-prefix comparison rejects those otherwise lossless caches;
+    exact ordered-subsequence comparison permits only extra authoritative rows
+    and still rejects every WebUI-only or edited cached message.
+    """
+    if not cached:
+        return True
+    cached_index = 0
+    for remote_message in authoritative:
+        if cached[cached_index] == remote_message:
+            cached_index += 1
+            if cached_index == len(cached):
+                return True
+    return False
+
+
 # ── Project helpers ──────────────────────────────────────────────────────────
 
 def load_projects() -> list:
@@ -883,6 +995,8 @@ def import_cli_session(
     created_at=None,
     updated_at=None,
     source_tag=None,
+    agent_session_id=None,
+    agent_lineage_root_id=None,
 ):
     """Create a new WebUI session populated with CLI messages.
     Returns the Session object.
@@ -898,6 +1012,12 @@ def import_cli_session(
         updated_at=updated_at,
         is_cli_session=True,
         source_tag=source_tag,
+        agent_session_id=agent_session_id or session_id,
+        agent_lineage_root_id=agent_lineage_root_id or agent_session_id or session_id,
+        agent_sync_hash=session_messages_hash(messages),
+        agent_sync_message_count=len(messages),
+        agent_sync_conflict=False,
+        agent_preserved_prefix_count=0,
     )
     s.save(touch_updated_at=False)
     return s
@@ -915,14 +1035,8 @@ def get_cli_sessions() -> list:
     import os
     cli_sessions = []
 
-    # Use the active WebUI profile's HERMES_HOME to find state.db.
-    # The active profile is determined by what the user has selected in the UI
-    # (stored in the server's runtime config). This means:
-    #   - default profile  -> ~/.hermes/state.db
-    #   - named profile X  -> ~/.hermes/profiles/X/state.db
-    # We resolve the active profile's home directory rather than just using
-    # HERMES_HOME (which is the server's launch profile, not necessarily the
-    # active one after a profile switch).
+    # Sidebar listing follows the process's active profile. Explicit sidecar
+    # refreshes use get_cli_session_snapshot(profile=...) below.
     try:
         from api.profiles import get_active_hermes_home
         hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
@@ -977,12 +1091,16 @@ def get_cli_sessions() -> list:
                 'message_count': row['message_count'] or row['actual_message_count'] or 0,
                 'created_at': row['started_at'],
                 'updated_at': raw_ts,
+                'last_message_at': raw_ts,
                 'pinned': False,
                 'archived': False,
                 'project_id': None,
                 'profile': profile,
                 'source_tag': _source,
                 'is_cli_session': True,
+                'agent_session_id': sid,
+                'agent_lineage_root_id': row.get('_lineage_root_id') or sid,
+                'compression_segment_count': row.get('_compression_segment_count') or 1,
             })
     except Exception as _cli_err:
         # DB schema changed, locked, or corrupted -- log warning so admins can diagnose.
@@ -995,6 +1113,45 @@ def get_cli_sessions() -> list:
         return []
 
     return cli_sessions
+
+
+def get_cli_session_snapshot(sid, profile=None, lineage_root_id=None) -> dict | None:
+    """Read Agent metadata and messages atomically for a safe cache refresh."""
+    try:
+        hermes_home = _get_agent_profile_home_strict(profile)
+        if hermes_home is None:
+            logger.warning(
+                "Refusing Agent snapshot fallback for missing profile %s (session %s)",
+                profile, sid,
+            )
+            return None
+        snapshot = read_agent_session_snapshot(
+            hermes_home / 'state.db',
+            sid,
+            lineage_root_id=lineage_root_id,
+            log=logger,
+            exclude_sources=None,
+        )
+    except Exception:
+        logger.exception("Failed to read Agent snapshot for session %s", sid)
+        return None
+    if not snapshot:
+        return None
+    row = snapshot['metadata']
+    agent_sid = row['id']
+    raw_ts = row.get('last_activity') or row.get('started_at') or 0
+    return {
+        'session_id': agent_sid,
+        'lineage_root_id': row.get('_lineage_root_id') or agent_sid,
+        'title': row.get('title') or f"{(row.get('source') or 'CLI').title()} Session",
+        'model': row.get('model') or 'unknown',
+        'profile': profile or 'default',
+        'source_tag': row.get('source') or 'cli',
+        'created_at': row.get('started_at'),
+        'updated_at': raw_ts,
+        'message_count': len(snapshot['messages']),
+        'messages': snapshot['messages'],
+    }
 
 
 def get_cli_session_messages(sid) -> list:
@@ -1025,7 +1182,7 @@ def get_cli_session_messages(sid) -> list:
                 SELECT role, content, timestamp
                 FROM messages
                 WHERE session_id = ?
-                ORDER BY timestamp ASC
+                ORDER BY timestamp ASC, id ASC
             """, (sid,))
             msgs = []
             for row in cur.fetchall():

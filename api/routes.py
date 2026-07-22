@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -445,7 +446,10 @@ from api.models import (
     import_cli_session,
     get_cli_sessions,
     get_cli_session_messages,
+    get_cli_session_snapshot,
     merge_imported_agent_session_projections,
+    session_messages_hash,
+    session_messages_are_ordered_subsequence,
 )
 from api.workspace import (
     load_workspaces,
@@ -988,7 +992,11 @@ def handle_get(handler, parsed) -> bool:
             merged = webui_sessions
             cli_count = 0
         merged.sort(
-            key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+            key=lambda s: (
+                s.get("last_message_at") or s.get("updated_at", 0) or 0,
+                s.get("profile") or "default",
+                s.get("session_id") or "",
+            ),
             reverse=True,
         )
         safe_merged = []
@@ -4025,109 +4033,129 @@ def _handle_memory_write(handler, body):
 
 
 def _handle_session_import_cli(handler, body):
-    """Import a single CLI session into the WebUI store."""
+    """Import or safely refresh one Agent session cache."""
     try:
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
 
     sid = str(body["session_id"])
+    hint = Session.load(sid)
+    if hint:
+        profile = hint.profile or 'default'
+        lookup_sid = hint.agent_session_id or sid
+        lineage_root_id = hint.agent_lineage_root_id or sid
+    else:
+        requested_profile = str(body.get("profile") or "").strip()
+        if requested_profile and not re.fullmatch(r"[A-Za-z0-9_-]+", requested_profile):
+            return bad(handler, "Invalid profile", 400)
+        try:
+            from api.profiles import get_active_profile_name
+            profile = requested_profile or get_active_profile_name() or 'default'
+        except Exception:
+            profile = requested_profile or 'default'
+        lookup_sid = str(body.get("agent_session_id") or sid)
+        lineage_root_id = str(body.get("agent_lineage_root_id") or lookup_sid)
 
-    # Check if already imported — refresh messages from CLI store if new ones arrived.
-    # A native WebUI same-ID collision is not an imported cache and must never be
-    # converted or overwritten by this bridge.
-    existing = Session.load(sid)
-    if existing:
-        if not existing.is_cli_session:
-            return j(
-                handler,
-                {
-                    "session": existing.compact()
-                    | {
-                        "messages": existing.messages,
-                        "is_cli_session": False,
-                    },
-                    "imported": False,
-                    "conflict": True,
-                },
-            )
-        fresh_msgs = get_cli_session_messages(sid)
-        cli_meta = next((cs for cs in get_cli_sessions() if cs["session_id"] == sid), None)
-        changed = False
-        if fresh_msgs and len(fresh_msgs) > len(existing.messages):
-            # Prefix-equality guard: only extend if existing messages are a prefix of
-            # the fresh CLI messages. Prevents silently dropping WebUI-added messages
-            # on hybrid sessions (user sent messages via WebUI while CLI continued).
-            if existing.messages == fresh_msgs[:len(existing.messages)]:
-                existing.messages = fresh_msgs
-                changed = True
-        if cli_meta and cli_meta.get("source_tag") and existing.source_tag != cli_meta["source_tag"]:
-            existing.source_tag = cli_meta["source_tag"]
-            changed = True
-        if cli_meta and cli_meta.get("updated_at"):
-            newer_updated_at = max(existing.updated_at or 0, cli_meta["updated_at"])
-            if newer_updated_at != existing.updated_at:
-                existing.updated_at = newer_updated_at
-                changed = True
-        if changed:
-            existing.save(touch_updated_at=False)
-        return j(
-            handler,
-            {
-                "session": existing.compact()
-                | {
-                    "messages": existing.messages,
-                    "is_cli_session": True,
-                },
-                "imported": False,
-            },
-        )
-
-    # Fetch messages from CLI store
-    msgs = get_cli_session_messages(sid)
-    if not msgs:
-        return bad(handler, "Session not found in CLI store", 404)
-
-    # Get profile, model, timestamps, and title from CLI session metadata
-    profile = None
-    created_at = None
-    updated_at = None
-    cli_title = None
-    model = "unknown"
-    source_tag = None
-    for cs in get_cli_sessions():
-        if cs["session_id"] == sid:
-            profile = cs.get("profile")
-            model = cs.get("model", "unknown")
-            created_at = cs.get("created_at")
-            updated_at = cs.get("updated_at")
-            cli_title = cs.get("title")
-            source_tag = cs.get("source_tag")
-            break
-
-    # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
-    title = cli_title or title_from(msgs, "CLI Session")
-
-    s = import_cli_session(
-        sid,
-        title,
-        msgs,
-        model,
+    # SQLite reads happen before taking the WebUI mutation lock. The snapshot
+    # helper reads metadata and messages in one transaction; a later Agent append
+    # is harmless and will be picked up by the next SSE refresh.
+    snapshot = get_cli_session_snapshot(
+        lookup_sid,
         profile=profile,
-        created_at=created_at,
-        updated_at=updated_at,
-        source_tag=source_tag,
+        lineage_root_id=lineage_root_id,
     )
-    s._cli_origin = sid
+    if not snapshot:
+        return bad(handler, "Session not found in Agent store", 404)
+
+    with _get_session_agent_lock(sid):
+        try:
+            existing = get_session(sid)
+        except KeyError:
+            existing = None
+
+        if existing:
+            if not existing.is_cli_session:
+                session = existing
+                imported = False
+                conflict = True
+            else:
+                fresh_msgs = snapshot["messages"]
+                fresh_hash = session_messages_hash(fresh_msgs)
+                current_hash = session_messages_hash(existing.messages)
+                if existing.agent_sync_hash:
+                    safe_to_replace = (
+                        current_hash == existing.agent_sync_hash
+                        or current_hash == fresh_hash
+                    )
+                else:
+                    safe_to_replace = session_messages_are_ordered_subsequence(
+                        existing.messages,
+                        fresh_msgs,
+                    )
+
+                existing.source_tag = snapshot["source_tag"]
+                previous_agent_session_id = existing.agent_session_id or sid
+                existing.agent_session_id = snapshot["session_id"]
+                existing.agent_lineage_root_id = snapshot["lineage_root_id"]
+                if safe_to_replace:
+                    if snapshot["session_id"] != previous_agent_session_id:
+                        # Compression rotated to a new Agent segment. Preserve the
+                        # complete visible history and append the new segment.
+                        preserved = list(existing.messages)
+                        synchronized_messages = preserved + fresh_msgs
+                        existing.agent_preserved_prefix_count = len(preserved)
+                    elif existing.agent_preserved_prefix_count:
+                        # Refresh only the current compressed segment while keeping
+                        # every pre-rotation message intact.
+                        preserved = existing.messages[:existing.agent_preserved_prefix_count]
+                        synchronized_messages = preserved + fresh_msgs
+                    else:
+                        synchronized_messages = fresh_msgs
+                    existing.messages = synchronized_messages
+                    existing.agent_sync_hash = session_messages_hash(synchronized_messages)
+                    existing.agent_sync_message_count = len(synchronized_messages)
+                    existing.agent_sync_conflict = False
+                    existing.updated_at = max(
+                        existing.updated_at or 0,
+                        snapshot.get("updated_at") or 0,
+                    )
+                else:
+                    existing.agent_sync_conflict = True
+                existing.save(touch_updated_at=False)
+                session = existing
+                imported = False
+                conflict = not safe_to_replace
+        else:
+            session = import_cli_session(
+                sid,
+                snapshot["title"],
+                snapshot["messages"],
+                snapshot["model"],
+                profile=profile,
+                created_at=snapshot.get("created_at"),
+                updated_at=snapshot.get("updated_at"),
+                source_tag=snapshot.get("source_tag"),
+                agent_session_id=snapshot.get("session_id"),
+                agent_lineage_root_id=snapshot.get("lineage_root_id"),
+            )
+            with LOCK:
+                SESSIONS[sid] = session
+                SESSIONS.move_to_end(sid)
+                while len(SESSIONS) > SESSIONS_MAX:
+                    SESSIONS.popitem(last=False)
+            imported = True
+            conflict = False
+
     return j(
         handler,
         {
-            "session": s.compact()
-            | {
-                "messages": msgs,
-                "is_cli_session": True,
+            "session": session.compact() | {
+                "messages": session.messages,
+                "is_cli_session": session.is_cli_session,
             },
-            "imported": True,
+            "imported": imported,
+            "conflict": conflict,
         },
     )
 
