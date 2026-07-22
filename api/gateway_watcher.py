@@ -65,6 +65,8 @@ def _get_agent_sessions_from_db() -> list:
                 'created_at': row['started_at'],
                 'updated_at': row['last_activity'] or row['started_at'],
                 'source': row['source'] or 'cli',
+                'agent_session_id': row['id'],
+                'agent_lineage_root_id': row.get('_lineage_root_id') or row['id'],
             })
         return sessions
     except Exception:

@@ -46,11 +46,21 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         if not parent_id:
             continue
         children_by_parent.setdefault(parent_id, []).append(row)
-        if _is_compression_continuation(rows_by_id.get(parent_id), row):
-            continuation_child_ids.add(row['id'])
 
-    for children in children_by_parent.values():
-        children.sort(key=lambda row: row.get('started_at') or 0, reverse=True)
+    for parent_id, children in children_by_parent.items():
+        children.sort(
+            key=lambda row: (row.get('started_at') or 0, row.get('id') or ''),
+            reverse=True,
+        )
+        continuations = [
+            child for child in children
+            if _is_compression_continuation(rows_by_id.get(parent_id), child)
+        ]
+        # A compression chain has one canonical continuation. If malformed or
+        # branched state contains siblings, preserve the others as independent
+        # visible conversations rather than silently dropping them.
+        if continuations:
+            continuation_child_ids.add(continuations[0]['id'])
 
     def compression_tip(row: dict) -> tuple[dict | None, int]:
         current = row
@@ -112,10 +122,113 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         projected.append(merged)
 
     projected.sort(
-        key=lambda row: row.get('last_activity') or row.get('started_at') or 0,
+        key=lambda row: (
+            row.get('last_activity') or row.get('started_at') or 0,
+            row.get('id') or '',
+        ),
         reverse=True,
     )
     return projected
+
+
+def _query_projected_agent_rows(
+    conn: sqlite3.Connection,
+    *,
+    log,
+    exclude_sources: tuple[str, ...] | None,
+) -> list[dict]:
+    """Query and project Agent rows using the caller's SQLite snapshot."""
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(sessions)")
+    session_cols = {row[1] for row in cur.fetchall()}
+    if 'source' not in session_cols:
+        log.warning(
+            "agent session listing skipped: state.db has no 'source' column "
+            "(older hermes-agent?). Upgrade hermes-agent to fix this."
+        )
+        return []
+
+    parent_expr = _optional_col('parent_session_id', session_cols)
+    ended_expr = _optional_col('ended_at', session_cols)
+    end_reason_expr = _optional_col('end_reason', session_cols)
+    where_clauses = ["s.source IS NOT NULL", "s.source != 'webui'"]
+    params: list[str] = []
+    if exclude_sources:
+        excluded = tuple(str(source) for source in exclude_sources if source)
+        if excluded:
+            placeholders = ", ".join("?" for _ in excluded)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(excluded)
+
+    cur.execute(
+        f"""
+        SELECT s.id, s.title, s.model, s.message_count,
+               s.started_at, s.source,
+               {parent_expr},
+               {ended_expr},
+               {end_reason_expr},
+               COUNT(m.id) AS actual_message_count,
+               MAX(m.timestamp) AS last_activity
+        FROM sessions s
+        LEFT JOIN messages m ON m.session_id = s.id
+        WHERE {' AND '.join(where_clauses)}
+        GROUP BY s.id
+        ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC, s.id DESC
+        """,
+        params,
+    )
+    return _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+
+
+def read_agent_session_snapshot(
+    db_path: Path,
+    session_id: str,
+    *,
+    lineage_root_id: str | None = None,
+    log=None,
+    exclude_sources: tuple[str, ...] | None = ("cron",),
+) -> dict | None:
+    """Read one projected Agent session and its messages from one DB snapshot."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return None
+    log = log or logger
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        rows = _query_projected_agent_rows(
+            conn,
+            log=log,
+            exclude_sources=exclude_sources,
+        )
+        candidate = next(
+            (
+                row for row in rows
+                if row.get('id') == session_id
+                or row.get('_lineage_root_id') == (lineage_root_id or session_id)
+            ),
+            None,
+        )
+        if not candidate:
+            return None
+        messages = [
+            {
+                'role': row['role'],
+                'content': row['content'],
+                'timestamp': row['timestamp'],
+            }
+            for row in conn.execute(
+                """
+                SELECT role, content, timestamp
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC, id ASC
+                """,
+                (candidate['id'],),
+            ).fetchall()
+        ]
+        return {'metadata': candidate, 'messages': messages}
 
 
 def read_importable_agent_session_rows(
@@ -144,53 +257,11 @@ def read_importable_agent_session_rows(
 
     log = log or logger
     with sqlite3.connect(str(db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        # Older Hermes Agent versions may not have source tracking. Without a
-        # source column we cannot safely distinguish WebUI rows from agent rows.
-        cur.execute("PRAGMA table_info(sessions)")
-        session_cols = {row[1] for row in cur.fetchall()}
-        if 'source' not in session_cols:
-            log.warning(
-                "agent session listing skipped: state.db at %s has no 'source' column "
-                "(older hermes-agent?). Agent sessions unavailable. "
-                "Upgrade hermes-agent to fix this.",
-                db_path,
-            )
-            return []
-
-        parent_expr = _optional_col('parent_session_id', session_cols)
-        ended_expr = _optional_col('ended_at', session_cols)
-        end_reason_expr = _optional_col('end_reason', session_cols)
-
-        where_clauses = ["s.source IS NOT NULL", "s.source != 'webui'"]
-        params: list[str] = []
-        if exclude_sources:
-            excluded = tuple(str(source) for source in exclude_sources if source)
-            if excluded:
-                placeholders = ", ".join("?" for _ in excluded)
-                where_clauses.append(f"s.source NOT IN ({placeholders})")
-                params.extend(excluded)
-
-        cur.execute(
-            f"""
-            SELECT s.id, s.title, s.model, s.message_count,
-                   s.started_at, s.source,
-                   {parent_expr},
-                   {ended_expr},
-                   {end_reason_expr},
-                   COUNT(m.id) AS actual_message_count,
-                   MAX(m.timestamp) AS last_activity
-            FROM sessions s
-            LEFT JOIN messages m ON m.session_id = s.id
-            WHERE {' AND '.join(where_clauses)}
-            GROUP BY s.id
-            ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC
-            """,
-            params,
+        projected = _query_projected_agent_rows(
+            conn,
+            log=log,
+            exclude_sources=exclude_sources,
         )
-        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
-        if limit is None:
-            return projected
-        return projected[:max(0, int(limit))]
+    if limit is None:
+        return projected
+    return projected[:max(0, int(limit))]
