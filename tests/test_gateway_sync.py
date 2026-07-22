@@ -865,6 +865,126 @@ def test_importing_older_gateway_session_preserves_original_timestamps_and_order
         post('/api/settings', {'show_cli_sessions': False})
 
 
+def test_imported_gateway_session_stays_linked_to_newer_agent_state():
+    """An imported sidecar must not shadow newer Telegram/CLI state.
+
+    The WebUI copy is a cache. Once the authoritative Agent row advances, the
+    sidebar should retain the CLI marker and surface newer metadata, and the
+    idempotent import endpoint should extend only an exact-prefix transcript.
+    """
+    conn = _ensure_state_db()
+    sid = 'gw_import_live_projection_001'
+    started_at = time.time() - 300
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Live imported Telegram session',
+            started_at=started_at,
+            message_count=2,
+        )
+        post('/api/settings', {'show_cli_sessions': True})
+
+        imported, imported_status = post('/api/session/import_cli', {'session_id': sid})
+        assert imported_status == 200, imported
+        assert imported['session']['is_cli_session'] is True
+        assert len(imported['session']['messages']) == 2
+
+        latest_at = time.time()
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, 'user', 'A newer Telegram turn', latest_at - 1),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, 'assistant', 'A newer Telegram response', latest_at),
+        )
+        conn.execute("UPDATE sessions SET message_count = 4 WHERE id = ?", (sid,))
+        conn.commit()
+
+        sessions_payload, sessions_status = get('/api/sessions')
+        assert sessions_status == 200, sessions_payload
+        matches = [s for s in sessions_payload.get('sessions', []) if s.get('session_id') == sid]
+        assert len(matches) == 1, matches
+        projected = matches[0]
+        assert projected.get('is_cli_session') is True, projected
+        assert projected.get('source_tag') == 'telegram', projected
+        assert projected.get('message_count') == 4, projected
+        assert projected.get('updated_at', 0) >= latest_at, projected
+
+        refreshed, refreshed_status = post('/api/session/import_cli', {'session_id': sid})
+        assert refreshed_status == 200, refreshed
+        assert refreshed['imported'] is False
+        assert refreshed['session']['is_cli_session'] is True
+        assert len(refreshed['session']['messages']) == 4
+
+        loaded, loaded_status = get(f'/api/session?session_id={sid}')
+        assert loaded_status == 200, loaded
+        assert loaded['session'].get('is_cli_session') is True, loaded['session']
+        assert len(loaded['session'].get('messages', [])) == 4
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        try:
+            post('/api/session/delete', {'session_id': sid})
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_imported_gateway_refresh_never_overwrites_diverged_webui_messages():
+    """A hybrid sidecar is preserved when it is no longer an Agent prefix."""
+    from api.models import Session
+
+    conn = _ensure_state_db()
+    sid = 'gw_import_diverged_projection_001'
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Diverged imported Telegram session',
+            message_count=2,
+        )
+        post('/api/settings', {'show_cli_sessions': True})
+        imported, imported_status = post('/api/session/import_cli', {'session_id': sid})
+        assert imported_status == 200, imported
+
+        local = Session.load(sid)
+        assert local is not None
+        local.messages.append({'role': 'user', 'content': 'WebUI-only branch message'})
+        local.save(touch_updated_at=False)
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, 'user', 'Different Telegram continuation', time.time()),
+        )
+        conn.execute("UPDATE sessions SET message_count = 3 WHERE id = ?", (sid,))
+        conn.commit()
+
+        refreshed, refreshed_status = post('/api/session/import_cli', {'session_id': sid})
+        assert refreshed_status == 200, refreshed
+        contents = [m.get('content') for m in refreshed['session']['messages']]
+        assert contents[-1] == 'WebUI-only branch message', contents
+        assert 'Different Telegram continuation' not in contents
+        assert len(contents) == 3
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
+        try:
+            post('/api/session/delete', {'session_id': sid})
+        except Exception:
+            pass
+        post('/api/settings', {'show_cli_sessions': False})
+
+
 
 def test_gateway_sse_stream_endpoint_exists():
     """GET /api/sessions/gateway/stream returns a response (200 or 200-range)."""
@@ -932,6 +1052,51 @@ def test_gateway_webui_sessions_not_duplicated():
         except Exception:
             pass
         post('/api/session/delete', {'session_id': webui_sid})
+        post('/api/settings', {'show_cli_sessions': False})
+
+
+def test_import_cli_never_overwrites_native_same_id_collision(cleanup_test_sessions):
+    """The bridge must not convert a native WebUI session that shares an Agent ID."""
+    from api.models import Session
+
+    sid = 'gw_native_collision_001'
+    cleanup_test_sessions.append(sid)
+    local_messages = [{'role': 'user', 'content': 'Native WebUI content must survive'}]
+    native = Session(
+        session_id=sid,
+        title='Native WebUI session',
+        messages=local_messages,
+        is_cli_session=False,
+    )
+    native.save(touch_updated_at=False)
+
+    conn = _ensure_state_db()
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source='telegram',
+            title='Different Telegram session',
+            message_count=2,
+        )
+        post('/api/settings', {'show_cli_sessions': True})
+
+        result, status = post('/api/session/import_cli', {'session_id': sid})
+        assert status == 200, result
+        assert result.get('conflict') is True, result
+        assert result['session']['is_cli_session'] is False
+        assert result['session']['messages'] == local_messages
+
+        reloaded = Session.load(sid)
+        assert reloaded is not None
+        assert reloaded.is_cli_session is False
+        assert reloaded.messages == local_messages
+    finally:
+        try:
+            _remove_test_sessions(conn, sid)
+            conn.close()
+        except Exception:
+            pass
         post('/api/settings', {'show_cli_sessions': False})
 
 

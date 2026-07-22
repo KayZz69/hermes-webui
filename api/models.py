@@ -317,6 +317,8 @@ class Session:
                  pending_started_at=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
+                 is_cli_session: bool=False,
+                 source_tag: str | None=None,
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
@@ -340,6 +342,8 @@ class Session:
         self.pending_started_at = pending_started_at
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
+        self.is_cli_session = bool(is_cli_session)
+        self.source_tag = source_tag or None
         self._metadata_message_count = None
 
     @property
@@ -359,6 +363,7 @@ class Session:
             'personality', 'active_stream_id',
             'pending_user_message', 'pending_attachments', 'pending_started_at',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
+            'is_cli_session', 'source_tag',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
         meta['messages'] = self.messages
@@ -450,6 +455,8 @@ class Session:
             'personality': self.personality,
             'compression_anchor_visible_idx': self.compression_anchor_visible_idx,
             'compression_anchor_message_key': self.compression_anchor_message_key,
+            'is_cli_session': self.is_cli_session,
+            'source_tag': self.source_tag,
             'active_stream_id': self.active_stream_id,
             'is_streaming': _is_streaming_session(
                 self.active_stream_id, active_stream_ids
@@ -726,6 +733,38 @@ def _hide_from_default_sidebar(session: dict) -> bool:
     return source == 'cron' or sid.startswith('cron_')
 
 
+def merge_imported_agent_session_projections(webui_sessions: list, agent_sessions: list) -> list:
+    """Merge Agent metadata into imported WebUI caches without mutating transcripts.
+
+    Native WebUI sessions remain authoritative for same-ID collisions. A local
+    sidecar is treated as an Agent cache only when it carries the durable
+    ``is_cli_session`` marker. For those rows, retain WebUI-only organization
+    fields and titles while surfacing newer Agent activity/count metadata.
+    """
+    agent_by_id = {s.get('session_id'): s for s in agent_sessions if s.get('session_id')}
+    merged = []
+    webui_ids = set()
+    for local in webui_sessions:
+        sid = local.get('session_id')
+        webui_ids.add(sid)
+        agent = agent_by_id.get(sid)
+        if not agent or not local.get('is_cli_session'):
+            merged.append(local)
+            continue
+
+        projected = dict(local)
+        projected['is_cli_session'] = True
+        projected['source_tag'] = agent.get('source_tag') or projected.get('source_tag')
+        for field in ('message_count', 'updated_at', 'last_message_at'):
+            values = [v for v in (projected.get(field), agent.get(field)) if v is not None]
+            if values:
+                projected[field] = max(values)
+        merged.append(projected)
+
+    merged.extend(s for s in agent_sessions if s.get('session_id') not in webui_ids)
+    return merged
+
+
 def all_sessions():
     active_stream_ids = _active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
@@ -738,7 +777,7 @@ def all_sessions():
             ]
             backfilled = []
             for i, s in enumerate(index):
-                if 'last_message_at' not in s:
+                if 'last_message_at' not in s or 'is_cli_session' not in s:
                     full = Session.load(s.get('session_id'))
                     if full:
                         index[i] = full.compact()
@@ -843,6 +882,7 @@ def import_cli_session(
     profile=None,
     created_at=None,
     updated_at=None,
+    source_tag=None,
 ):
     """Create a new WebUI session populated with CLI messages.
     Returns the Session object.
@@ -856,6 +896,8 @@ def import_cli_session(
         profile=profile,
         created_at=created_at,
         updated_at=updated_at,
+        is_cli_session=True,
+        source_tag=source_tag,
     )
     s.save(touch_updated_at=False)
     return s

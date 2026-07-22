@@ -445,6 +445,7 @@ from api.models import (
     import_cli_session,
     get_cli_sessions,
     get_cli_session_messages,
+    merge_imported_agent_session_projections,
 )
 from api.workspace import (
     load_workspaces,
@@ -978,14 +979,14 @@ def handle_get(handler, parsed) -> bool:
         settings = load_settings()
         if settings.get("show_cli_sessions"):
             cli = get_cli_sessions()
-            webui_ids = {s["session_id"] for s in webui_sessions}
             from api.models import _hide_from_default_sidebar as _cron_hide
-            deduped_cli = [s for s in cli
-                           if s["session_id"] not in webui_ids
-                           and not _cron_hide(s)]
+            visible_cli = [s for s in cli if not _cron_hide(s)]
+            webui_ids = {s.get("session_id") for s in webui_sessions}
+            merged = merge_imported_agent_session_projections(webui_sessions, visible_cli)
+            cli_count = sum(1 for s in visible_cli if s.get("session_id") not in webui_ids)
         else:
-            deduped_cli = []
-        merged = webui_sessions + deduped_cli
+            merged = webui_sessions
+            cli_count = 0
         merged.sort(
             key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
             reverse=True,
@@ -998,7 +999,7 @@ def handle_get(handler, parsed) -> bool:
             safe_merged.append(item)
         return j(handler, {
             "sessions": safe_merged,
-            "cli_count": len(deduped_cli),
+            "cli_count": cli_count,
             "server_time": time.time(),
             "server_tz": time.strftime("%z"),
         })
@@ -4032,17 +4033,44 @@ def _handle_session_import_cli(handler, body):
 
     sid = str(body["session_id"])
 
-    # Check if already imported — refresh messages from CLI store if new ones arrived
+    # Check if already imported — refresh messages from CLI store if new ones arrived.
+    # A native WebUI same-ID collision is not an imported cache and must never be
+    # converted or overwritten by this bridge.
     existing = Session.load(sid)
     if existing:
+        if not existing.is_cli_session:
+            return j(
+                handler,
+                {
+                    "session": existing.compact()
+                    | {
+                        "messages": existing.messages,
+                        "is_cli_session": False,
+                    },
+                    "imported": False,
+                    "conflict": True,
+                },
+            )
         fresh_msgs = get_cli_session_messages(sid)
+        cli_meta = next((cs for cs in get_cli_sessions() if cs["session_id"] == sid), None)
+        changed = False
         if fresh_msgs and len(fresh_msgs) > len(existing.messages):
             # Prefix-equality guard: only extend if existing messages are a prefix of
             # the fresh CLI messages. Prevents silently dropping WebUI-added messages
             # on hybrid sessions (user sent messages via WebUI while CLI continued).
             if existing.messages == fresh_msgs[:len(existing.messages)]:
                 existing.messages = fresh_msgs
-                existing.save(touch_updated_at=False)
+                changed = True
+        if cli_meta and cli_meta.get("source_tag") and existing.source_tag != cli_meta["source_tag"]:
+            existing.source_tag = cli_meta["source_tag"]
+            changed = True
+        if cli_meta and cli_meta.get("updated_at"):
+            newer_updated_at = max(existing.updated_at or 0, cli_meta["updated_at"])
+            if newer_updated_at != existing.updated_at:
+                existing.updated_at = newer_updated_at
+                changed = True
+        if changed:
+            existing.save(touch_updated_at=False)
         return j(
             handler,
             {
@@ -4065,6 +4093,8 @@ def _handle_session_import_cli(handler, body):
     created_at = None
     updated_at = None
     cli_title = None
+    model = "unknown"
+    source_tag = None
     for cs in get_cli_sessions():
         if cs["session_id"] == sid:
             profile = cs.get("profile")
@@ -4072,6 +4102,7 @@ def _handle_session_import_cli(handler, body):
             created_at = cs.get("created_at")
             updated_at = cs.get("updated_at")
             cli_title = cs.get("title")
+            source_tag = cs.get("source_tag")
             break
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
@@ -4085,10 +4116,9 @@ def _handle_session_import_cli(handler, body):
         profile=profile,
         created_at=created_at,
         updated_at=updated_at,
+        source_tag=source_tag,
     )
-    s.is_cli_session = True
     s._cli_origin = sid
-    s.save(touch_updated_at=False)
     return j(
         handler,
         {
