@@ -193,10 +193,10 @@ def test_sidebar_source_webui_includes_hidden_archived_parent_reference(monkeypa
 
     body = handler.json_body()
     assert handler.status == 200
-    assert [row["session_id"] for row in body["sessions"]] == ["webui-child"]
-    assert [row["session_id"] for row in body["sidebar_reference_sessions"]] == ["webui-parent"]
-    assert body["sidebar_reference_sessions"][0]["archived"] is True
-    assert body["sidebar_reference_sessions"][0]["_sidebar_reference_only"] is True
+    assert [row["session_id"] for row in body["sessions"]] == []
+    # The internal child is hidden, so no synthetic archived-parent reference
+    # is needed in the sidebar payload either.
+    assert [row["session_id"] for row in body["sidebar_reference_sessions"]] == []
 
 
 def test_sidebar_source_cli_excludes_webui_rows(monkeypatch):
