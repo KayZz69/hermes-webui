@@ -2381,6 +2381,13 @@ def _build_session_list_cache_payload(
             diag_stage=diag_stage,
         )
         deduped_cli = []
+    # Delegated subagent transcripts are internal worker artifacts. Keep their
+    # canonical state and detail endpoint intact, but never present them as
+    # user-facing sidebar conversations. Apply this after the native/CLI merge
+    # so stale or materialized sidecars are covered as well, and before profile,
+    # archive, source, and count calculations so the response stays consistent.
+    webui_sessions = [s for s in webui_sessions if not _is_subagent_sidebar_row(s)]
+    deduped_cli = [s for s in deduped_cli if not _is_subagent_sidebar_row(s)]
     diag_stage("sort_sessions")
     merged = webui_sessions + deduped_cli
     merged.sort(
@@ -9112,6 +9119,29 @@ def _normalize_sidebar_source_flags(session: dict) -> dict:
     normalized = dict(session)
     normalized["is_cli_session"] = is_cli_session_row(normalized)
     return normalized
+
+
+def _is_subagent_sidebar_row(session: dict) -> bool:
+    """Return True for internal delegated-child rows hidden from the sidebar.
+
+    Subagent transcripts remain authoritative and viewable by ID, but they are
+    internal worker artifacts rather than user-facing conversations. Use both
+    explicit source metadata and the state.db lookup so stale/materialized
+    sidecars cannot leak a delegated child back into the default sidebar.
+    """
+    if not isinstance(session, dict):
+        return False
+    source = str(
+        session.get("source_tag")
+        or session.get("raw_source")
+        or session.get("session_source")
+        or session.get("source")
+        or ""
+    ).strip().lower()
+    if source == "subagent":
+        return True
+    sid = str(session.get("session_id") or "").strip()
+    return bool(sid and _is_subagent_child_session_id(sid))
 
 
 def _reconcile_session_detail_source_flags(session: dict, state_meta: dict) -> dict:
