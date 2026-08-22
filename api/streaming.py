@@ -189,6 +189,25 @@ def _redacted_session_payload_with_full_messages(session, *, tool_calls=None) ->
         return None
 
 
+def _emit_post_commit_stream_recovery(put, session_id, stream_id) -> None:
+    """Close a stream after durable success without persisting a false error."""
+    logger.error(
+        "[webui] post-commit stream finalization failed for session=%s stream=%s",
+        session_id,
+        stream_id,
+        exc_info=True,
+    )
+    try:
+        put('stream_end', {'session_id': session_id})
+    except Exception:
+        logger.debug(
+            "Failed to emit stream_end after post-commit failure for session=%s stream=%s",
+            session_id,
+            stream_id,
+            exc_info=True,
+        )
+
+
 def _ephemeral_session_payload(session_id: str, messages) -> dict:
     """Project the non-persistent ``/btw`` terminal session for public SSE."""
     return redact_session_data(
@@ -11597,6 +11616,15 @@ def _run_agent_streaming(
                 else: os.environ['HERMES_HOME'] = old_hermes_home
 
     except Exception as e:
+        # The durable transcript has already been committed at this point. A
+        # failure in terminal SSE payload construction, metering, diagnostics,
+        # or title scheduling must not turn a successful assistant answer into
+        # a persisted provider-error marker. Close the stream and let the
+        # frontend's normal stream-end recovery reload the authoritative session
+        # snapshot from disk.
+        if _success_writeback_committed:
+            _emit_post_commit_stream_recovery(put, session_id, stream_id)
+            return
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
         err_str = str(e)
         # Sanitize HTML from provider error responses — some providers return
