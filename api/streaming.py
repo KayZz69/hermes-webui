@@ -10848,6 +10848,21 @@ def _run_agent_streaming(
                     s.messages,
                     live_tool_calls=_live_tool_calls,
                 )
+                # Freeze generated-image artifacts at settle time so historical
+                # tool-card previews keep the bytes the turn emitted (same
+                # content-addressed store the message annotator uses). A
+                # same-path overwrite after regeneration would otherwise
+                # silently rewrite the historical card's preview. The
+                # previously persisted tool_calls carry FINAL digests — pass
+                # them in or the rebuilt list would re-capture current bytes.
+                try:
+                    from api.media_snapshots import annotate_tool_call_snapshots
+
+                    annotate_tool_call_snapshots(
+                        tool_calls, previous_tool_calls=getattr(s, "tool_calls", None)
+                    )
+                except Exception:
+                    logger.debug("Tool-call media snapshot annotation failed", exc_info=True)
                 s.tool_calls = tool_calls
                 s.active_stream_id = None
                 s.pending_user_message = None
