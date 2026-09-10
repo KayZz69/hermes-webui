@@ -18460,10 +18460,26 @@ function _toolDetailLeadText(kind, tc){
   if(!target) return '';
   return target;
 }
+function _generatedImageArtifactRef(tc){
+  if(!tc) return '';
+  const snippet=String(tc.snippet||'');
+  if(snippet.includes('MEDIA:')){
+    const match=snippet.match(/MEDIA:([^\s\)\]]+)/);
+    if(match&&match[1]) return match[1];
+  }
+  try{
+    const data=JSON.parse(snippet||'{}');
+    if(data&&data.success&&typeof data.image==='string'&&data.image.trim()) return data.image.trim();
+  }catch(_){}
+  return '';
+}
+
 function buildToolCard(tc){
   const row=document.createElement('div');
   row.className='tool-card-row';
   if(!row.dataset) row.dataset={};
+  const isGeneratedImage=tc&&tc.name==='image_generate'&&tc.done!==false&&!tc.is_error;
+  const imageRef=isGeneratedImage?_generatedImageArtifactRef(tc):'';
   row.dataset.toolName=String(tc&&tc.name||'tool');
   const toolKind=typeof _toolActionKind==='function'?_toolActionKind(tc):'unknown';
   row.dataset.toolKind=toolKind;
@@ -18475,7 +18491,7 @@ function buildToolCard(tc){
   const icon=toolIcon(tc.name);
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
   const allowsDetail=typeof _toolCardAllowsDetail==='function'?_toolCardAllowsDetail(toolKind,tc):true;
-  const hasDetail=hasRawDetail&&allowsDetail;
+  const hasDetail=(hasRawDetail||!!imageRef)&&allowsDetail;
   let displaySnippet='';
   if(tc.snippet){
     const s=tc.snippet;
@@ -18492,7 +18508,7 @@ function buildToolCard(tc){
   const runIndicator=tc.done===false?'<span class="tool-card-running-dot"></span>':'';
   const isSubagent=tc.name==='subagent_progress';
   const isDelegation=tc.name==='delegate_task';
-  const openClass='';
+  const openClass=imageRef?' open':'';
   const cardClass='tool-card'+(tc.done===false?' tool-card-running':'')+(isSubagent?' tool-card-subagent':'')+(hasDetail?'':' tool-card-no-detail')+openClass;
   const headerClick=hasDetail?' onclick="this.closest(\'.tool-card\').classList.toggle(\'open\')"':'';
   // Clean up legacy subagent prefixes since the Lucide icon already shows it
@@ -18502,11 +18518,13 @@ function buildToolCard(tc){
   const argPreview=_formatToolArgPreview(tc&&tc.args);
   if(toolKind==='shell'||previewText===argPreview||previewText==='Completed'||previewText==='Running'||previewText==='Failed') previewText='';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
+  if(imageRef) previewText=t('generated_image_preview')||'Generated image';
   const detailLeadText=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
   const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind):(toolKind==='shell'?'Shell':'Input');
   const detailLead=detailLeadText?`<div class="tool-card-detail-lead"><div class="tool-card-detail-lead-label">${esc(detailLeadLabel)}</div><pre>${esc(detailLeadText)}</pre></div>`:'';
   const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
   const visibleArgs=(detailLeadText&&toolKind==='shell')?[]:argsEntries;
+  const generatedImageHtml=imageRef?`<div class="generated-image-preview">${_inlineMediaHtmlForRef(imageRef)}</div>`:'';
   row.innerHTML=`
     <div class="${cardClass}">
       <div class="tool-card-header"${headerClick}>
@@ -18517,6 +18535,7 @@ function buildToolCard(tc){
         ${hasDetail?`<span class="tool-card-toggle">${li('chevron-right',12)}</span>`:''}
       </div>
       ${hasDetail?`<div class="tool-card-detail">
+        ${generatedImageHtml}
         ${detailLead}
         ${visibleArgs.length?`<div class="tool-card-args">${
           visibleArgs.map(([k,v])=>{

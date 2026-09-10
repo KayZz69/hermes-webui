@@ -1745,6 +1745,7 @@ const LOCALES = {
     media_svg_label: 'Diagram',
     media_video_label: 'Video',
     media_download: 'Download',
+    generated_image_preview: 'Generated image',
     csv_loading: 'Loading CSV',
     csv_too_large: 'CSV file too large for inline rendering',
     csv_no_data: 'CSV file has insufficient data to render as table',

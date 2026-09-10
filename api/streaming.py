@@ -7154,7 +7154,14 @@ def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
         data = raw if isinstance(raw, dict) else json.loads(text)
         if isinstance(data, dict):
             preview = data.get('output') or data.get('result') or data.get('error') or text
-            text = str(preview)
+            # image_generate returns the deliverable in ``image``; a raw JSON
+            # payload in the card detail is the historical link-only gap.
+            image = data.get('image')
+            if isinstance(image, str) and image.strip():
+                preview = image.strip()
+                text = f"{preview}\nMEDIA:{preview}"
+            else:
+                text = str(preview)
     except Exception:
         pass
     return text[:limit]

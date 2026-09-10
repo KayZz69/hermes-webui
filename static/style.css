@@ -2496,6 +2496,12 @@
   .msg-artifact-download:focus-visible{opacity:1;pointer-events:auto;outline:2px solid var(--accent-bg-strong);outline-offset:1px;}
   @media (hover:none){.msg-artifact-download{opacity:1;pointer-events:auto;transform:none;}}
 
+  /* Generated-image tool detail: keep the preview visually prominent while
+     reusing the existing image artifact treatment and /api/media gating. */
+  .generated-image-preview{margin:0 0 8px;}
+  .generated-image-preview .msg-artifact-image{margin:0;}
+  .generated-image-preview .msg-media-img{max-width:100%;}
+
   /* ── Inline SVG rendering ── */
   .msg-media-svg{display:block;max-width:100%;height:auto;border-radius:6px;margin:6px 0;border:1px solid var(--border);background:var(--surface);}
   .msg-media-label{display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:4px;user-select:none;}
