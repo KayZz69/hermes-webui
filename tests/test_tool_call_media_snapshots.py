@@ -156,6 +156,19 @@ def test_persisted_digest_survives_list_rebuild_across_settles(snap_dir, tmp_pat
 
     assert snapshot_path_for_digest(original_digest).read_bytes() == PNG_BYTES
 
+    # A NEW call for the same path (different tid) captures the CURRENT bytes
+    # as its own digest — per-tid keying must not collapse v1 and v2.
+    new_call = _image_tool_call(str(source))
+    new_call["tid"] = "call-snap-2"
+    annotate_tool_call_snapshots(
+        [new_call], previous_tool_calls=original_calls, allowed_predicate=_allow_all
+    )
+    new_digest = new_call["_media_snapshots"][str(source)]
+    assert new_digest != original_digest
+    from api.media_snapshots import snapshot_path_for_digest as _spd
+
+    assert _spd(new_digest).read_bytes() == b"v2-new-bytes"
+
 
 def test_end_to_end_extract_then_annotate(snap_dir, tmp_path):
     """The settle path: extraction output feeds the annotator directly."""
