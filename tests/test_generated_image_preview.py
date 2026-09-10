@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import json
 
-from api.streaming import _extract_tool_calls_from_messages, _tool_result_snippet
+from api.streaming import (
+    _TOOL_RESULT_SNIPPET_MAX,
+    _extract_tool_calls_from_messages,
+    _tool_result_snippet,
+)
 
 
 def _image_payload(path: str = "/root/.hermes/cache/images/generated.png") -> dict:
@@ -76,3 +80,23 @@ def test_failed_image_generate_result_does_not_mint_media_reference():
 
     assert result == "provider unavailable"
     assert "MEDIA:" not in result
+
+
+def test_oversized_image_path_media_reference_stays_whole():
+    """A path longer than the snippet cap must not split the MEDIA: reference.
+
+    The frontend's MEDIA regex matches any unbroken token, so a reference
+    truncated mid-path would still mint a (dead) /api/media preview request.
+    Cap the path before composing the MEDIA: line so the whole reference
+    survives the `[:limit]` cut intact.
+    """
+    long_path = "/tmp/" + "x" * 4000 + ".png"
+    result = _tool_result_snippet(json.dumps({"success": True, "image": long_path}))
+
+    # The composed reference is capped to fit under the snippet limit.
+    assert len(result) <= _TOOL_RESULT_SNIPPET_MAX
+    # The MEDIA: token itself must be intact: exactly one reference, and the
+    # path it names must equal the (capped) first line.
+    first_line, media_ref = result.split("\nMEDIA:", 1)
+    assert media_ref == first_line
+    assert result.count("MEDIA:") == 1
