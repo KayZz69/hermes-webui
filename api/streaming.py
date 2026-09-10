@@ -7158,8 +7158,20 @@ def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
             # payload in the card detail is the historical link-only gap.
             image = data.get('image')
             if isinstance(image, str) and image.strip():
-                preview = image.strip()
-                text = f"{preview}\nMEDIA:{preview}"
+                # Compose the MEDIA: reference so it survives the `[:limit]` cut
+                # below whole: the path is capped to (limit - 7) // 2 so the
+                # full ``{path}\nMEDIA:{path}`` always fits. A reference split
+                # mid-path would still match the frontend's MEDIA regex and mint
+                # a dead /api/media preview request. When even the bare
+                # ``MEDIA:<path>`` token cannot fit, fall back to capped path
+                # text only (a truncated token would be worse than none).
+                path_text = image.strip()
+                preview_len = max(0, (limit - 7) // 2)
+                if limit >= 7:
+                    preview = path_text[:preview_len]
+                    text = f"{preview}\nMEDIA:{preview}"
+                else:
+                    text = path_text[:limit]
             else:
                 text = str(preview)
     except Exception:
