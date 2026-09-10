@@ -18525,16 +18525,7 @@ function buildToolCard(tc){
   const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
   const visibleArgs=(detailLeadText&&toolKind==='shell')?[]:argsEntries;
   const generatedImageHtml=imageRef?`<div class="generated-image-preview">${_inlineMediaHtmlForRef(imageRef)}</div>`:'';
-  row.innerHTML=`
-    <div class="${cardClass}">
-      <div class="tool-card-header"${headerClick}>
-        ${runIndicator}
-        <span class="tool-card-icon">${icon}</span>
-        <span class="tool-card-name"><span class="tool-card-name-label">${esc(displayName)}</span><span class="tool-card-name-generic">${esc(genericName)}</span></span>
-        <span class="tool-card-preview">${esc(previewText)}</span>
-        ${hasDetail?`<span class="tool-card-toggle">${li('chevron-right',12)}</span>`:''}
-      </div>
-      ${hasDetail?`<div class="tool-card-detail">
+  const cardDetailHtml=hasDetail?`<div class="tool-card-detail">
         ${generatedImageHtml}
         ${detailLead}
         ${visibleArgs.length?`<div class="tool-card-args">${
@@ -18548,7 +18539,23 @@ function buildToolCard(tc){
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
           ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
-      </div>`:''}
+      </div>`:'';
+  // Settled tool cards carry the same per-call path→digest map messages do: stamp the
+  // generated-image preview URL (and download href) with &snap=<digest> so a same-path
+  // file overwrite after regeneration cannot silently rewrite this card's history.
+  const stampedDetailHtml=(imageRef&&tc&&tc._media_snapshots&&typeof tc._media_snapshots==='object')
+    ? _stampMediaSnapshots(cardDetailHtml, tc._media_snapshots)
+    : cardDetailHtml;
+  row.innerHTML=`
+    <div class="${cardClass}">
+      <div class="tool-card-header"${headerClick}>
+        ${runIndicator}
+        <span class="tool-card-icon">${icon}</span>
+        <span class="tool-card-name"><span class="tool-card-name-label">${esc(displayName)}</span><span class="tool-card-name-generic">${esc(genericName)}</span></span>
+        <span class="tool-card-preview">${esc(previewText)}</span>
+        ${hasDetail?`<span class="tool-card-toggle">${li('chevron-right',12)}</span>`:''}
+      </div>
+      ${stampedDetailHtml}
     </div>`;
   row._tcData = tc;
   // Durable classification flags: _tcData (a JS property) does NOT survive the

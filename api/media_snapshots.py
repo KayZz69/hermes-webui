@@ -498,3 +498,70 @@ def annotate_media_snapshots(
         if changed:
             msg["_media_snapshots"] = snaps
     return captured
+
+
+def annotate_tool_call_snapshots(tool_calls, *, resolve_ref=None, allowed_predicate=None) -> int:
+    """Snapshot local-file MEDIA: refs inside persisted tool-call summaries.
+
+    Mirrors :func:`annotate_media_snapshots` for the compact ``session.tool_calls``
+    entries built by ``streaming._extract_tool_calls_from_messages``. Without this,
+    a generated-image tool card renders the LIVE file: regenerating with the same
+    prompt (in-place overwrite, same cache filename pattern differs — but any
+    same-path rewrite) silently rewrites the historical card's preview.
+
+    Writes ``_media_snapshots`` ({path: digest}) onto each tool_call dict whose
+    ``snippet`` contains at least one resolvable local ``MEDIA:`` ref. Same
+    guarantees as the message annotator: same resolve/allow predicates, FINAL
+    digests (no re-capture once stamped), idempotent across re-settles.
+
+    Returns the number of new snapshots captured.
+    """
+    import re as _re
+
+    if resolve_ref is None:
+        resolve_ref = resolve_media_ref
+    if allowed_predicate is None:
+        allowed_predicate = media_capture_allowed
+    if not isinstance(tool_calls, list):
+        return 0
+    media_re = _re.compile(r"MEDIA:([^\s\)\]]+)")
+    captured = 0
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        snippet = tc.get("snippet")
+        if not isinstance(snippet, str) or "MEDIA:" not in snippet:
+            continue
+        refs = media_re.findall(snippet)
+        if not refs:
+            continue
+        existing = tc.get("_media_snapshots")
+        snaps = dict(existing) if isinstance(existing, dict) else {}
+        changed = False
+        for raw_ref in refs:
+            try:
+                path = resolve_ref(raw_ref)
+            except Exception:
+                path = None
+            if path is None:
+                continue
+            keys = [str(path)]
+            if raw_ref not in keys:
+                keys.append(raw_ref)
+            pending = [k for k in keys if not (snaps.get(k) and is_valid_digest(snaps[k]))]
+            if not pending:
+                continue
+            try:
+                if allowed_predicate is not None and not allowed_predicate(path):
+                    continue
+            except Exception:
+                continue
+            digest = capture_snapshot(path)
+            if digest:
+                for k in keys:
+                    snaps[k] = digest
+                changed = True
+                captured += 1
+        if changed:
+            tc["_media_snapshots"] = snaps
+    return captured
