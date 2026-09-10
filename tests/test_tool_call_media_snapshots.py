@@ -127,6 +127,36 @@ def test_denied_paths_are_never_captured(snap_dir, tmp_path):
     assert "_media_snapshots" not in tc
 
 
+def test_persisted_digest_survives_list_rebuild_across_settles(snap_dir, tmp_path):
+    """THE settle-path regression: every turn rebuilds s.tool_calls from scratch,
+    discarding the annotated dicts. Without carry-forward by tid, a later re-settle
+    re-captures the CURRENT live bytes and rebinds a historical digest — silently
+    rewriting history. The previous persisted list must seed FINAL digests.
+    """
+    source = tmp_path / "card.png"
+    source.write_bytes(PNG_BYTES)
+    # Turn 1: capture original bytes.
+    original_calls = [_image_tool_call(str(source))]
+    assert annotate_tool_call_snapshots(original_calls, allowed_predicate=_allow_all) == 1
+    original_digest = original_calls[0]["_media_snapshots"][str(source)]
+
+    # The file changes in place (agent regenerated into the same path).
+    source.write_bytes(b"v2-new-bytes")
+
+    # Turn 2: production rebuilds summaries from scratch (no stamps), then annotates
+    # with the PREVIOUS persisted list passed through.
+    rebuilt_calls = [_image_tool_call(str(source))]
+    annotate_tool_call_snapshots(
+        rebuilt_calls, previous_tool_calls=original_calls, allowed_predicate=_allow_all
+    )
+
+    # The rebuilt entry inherits the ORIGINAL digest — history not rebound.
+    assert rebuilt_calls[0]["_media_snapshots"][str(source)] == original_digest
+    from api.media_snapshots import snapshot_path_for_digest
+
+    assert snapshot_path_for_digest(original_digest).read_bytes() == PNG_BYTES
+
+
 def test_end_to_end_extract_then_annotate(snap_dir, tmp_path):
     """The settle path: extraction output feeds the annotator directly."""
     source = tmp_path / "card.png"
