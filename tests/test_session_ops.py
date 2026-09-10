@@ -11,12 +11,13 @@ import urllib.error
 
 import pytest
 
-from tests.conftest import TEST_BASE, _post, make_session_tracked
+from tests.conftest import TEST_BASE, TEST_STATE_DIR, _post, make_session_tracked
 
 
-def _get(path):
+def _get(path, headers=None):
     """GET helper -- returns parsed JSON, or raises HTTPError on non-2xx."""
-    with urllib.request.urlopen(TEST_BASE + path, timeout=10) as r:
+    req = urllib.request.Request(TEST_BASE + path, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
 
@@ -218,6 +219,8 @@ def test_status_returns_summary(cleanup_test_sessions):
     assert r['title'] == 'test'
     assert r['message_count'] == 3
     assert 'model' in r
+    assert r['profile'] == 'default'
+    assert r['hermes_home'] == str(TEST_STATE_DIR)
     assert 'workspace' in r
     assert 'created_at' in r
     assert 'updated_at' in r
@@ -231,6 +234,20 @@ def test_status_returns_summary(cleanup_test_sessions):
     assert r['input_tokens'] == 0
     assert r['output_tokens'] == 0
     assert r['total_tokens'] == 0
+
+
+def test_status_returns_profile_specific_hermes_home(cleanup_test_sessions):
+    data = _post(TEST_BASE, '/api/session/new', {'profile': 'research'})
+    sid = data['session']['session_id']
+    cleanup_test_sessions.append(sid)
+
+    r = _get(
+        f'/api/session/status?session_id={sid}',
+        headers={'Cookie': 'hermes_profile=research'},
+    )
+
+    assert r['profile'] == 'research'
+    assert r['hermes_home'] == str(TEST_STATE_DIR / 'profiles' / 'research')
 
 
 def test_status_unknown_returns_404():

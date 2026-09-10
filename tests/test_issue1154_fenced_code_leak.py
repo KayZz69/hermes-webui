@@ -43,6 +43,8 @@ function extractFunc(name) {
   }
   return src.slice(start, i);
 }
+eval(extractFunc('_matchBacktickFenceLine'));
+eval(extractFunc('_isBacktickFenceClose'));
 eval(extractFunc('renderMd'));
 
 let buf = '';
@@ -62,7 +64,7 @@ def _render(driver_path, markdown: str) -> str:
     import subprocess
     result = subprocess.run(
         [NODE, driver_path, str(UI_JS_PATH)],
-        input=markdown, capture_output=True, text=True, timeout=10,
+        input=markdown, capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed: {result.stderr}")

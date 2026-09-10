@@ -15,7 +15,7 @@ REPO = pathlib.Path(__file__).parent.parent
 
 
 def read(rel):
-    return (REPO / rel).read_text()
+    return (REPO / rel).read_text(encoding="utf-8")
 
 
 # ── Group A: /root workspace ──────────────────────────────────────────────────
@@ -194,10 +194,16 @@ class TestSystemTheme:
 
     def test_panels_reverts_via_apply_theme(self):
         src = read("static/panels.js")
-        assert "_applyTheme(_settingsThemeOnOpen)" in src or \
-               "_applyTheme(" in src, (
-            "_revertSettingsPreview must call _applyTheme() so 'system' "
-            "is correctly re-activated on settings discard"
+        block = re.search(r"function _revertSettingsPreview\(\)\{.*?\n\}", src, re.DOTALL)
+        assert block, "_revertSettingsPreview() should be present"
+        assert "_applyTheme(" not in block.group(0), (
+            "_revertSettingsPreview must no longer call _applyTheme() since Appearance now autosaves"
+        )
+
+    def test_system_theme_apply_path_uses_apply_theme(self):
+        src = read("static/boot.js")
+        assert "_applyTheme(appearance.theme)" in src, (
+            "System theme still must be activated through _applyTheme() in boot/theme application"
         )
 
     def test_panels_saves_system_string_not_resolved(self):
@@ -230,9 +236,18 @@ class TestSystemTheme:
             "_applyTheme must remove the previous OS-theme listener before adding a new one"
         )
 
+    def test_boot_reconcile_treats_light_dark_as_explicit_theme_choices(self):
+        src = read("static/boot.js")
+        assert "['system','light','dark'].includes(lsTheme)" in src, (
+            "boot appearance reconciliation must preserve explicit light/dark/system "
+            "localStorage selections when a prior autosave failed"
+        )
+
     def test_panels_hydrates_appearance_before_models_fetch(self):
         src = read("static/panels.js")
-        skin_idx = src.index("const skinVal=(settings.skin||'default').toLowerCase();")
+        # PR #2799 (v0.51.119): skin precedence now prefers localStorage over settings.skin
+        # so the inline-gate-resolved DOM skin survives the picker hydration.
+        skin_idx = src.index("const skinVal=(localStorage.getItem('hermes-skin')||settings.skin||'default').toLowerCase();")
         # models is now declared as let models=null before the try block
         models_idx = src.index("models=await api('/api/models');")
         assert skin_idx < models_idx, (

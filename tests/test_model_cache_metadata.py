@@ -21,19 +21,37 @@ def test_save_models_cache_to_disk_preserves_response_metadata(tmp_path, monkeyp
     payload = {
         "active_provider": "openai",
         "default_model": "gpt-5.4-mini",
+        "configured_model_badges": {},
         "groups": [
             {
                 "provider": "OpenAI",
                 "provider_id": "openai",
-                "models": [{"id": "gpt-5.4-mini", "label": "GPT 5.4 Mini"}],
+                "models": [{"id": "gpt-5.4-mini", "label": "GPT 5.4 Mini", "supports_fast_tier": True}],
             }
         ],
     }
 
     config._save_models_cache_to_disk(payload)
 
-    assert json.loads(cache_path.read_text(encoding="utf-8")) == payload
-    assert config._load_models_cache_from_disk() == payload
+    on_disk = json.loads(cache_path.read_text(encoding="utf-8"))
+    # The four response-shape fields round-trip verbatim.
+    for k, v in payload.items():
+        assert on_disk[k] == v, f"Field {k!r} did not round-trip"
+    # Plus the disk-only metadata stamps added by #1633 — present but not part
+    # of the response payload.
+    assert "_schema_version" in on_disk
+    # _webui_version may be absent in early-init paths where api.updates isn't
+    # yet imported; in normal test runs api.updates IS imported, so assert it.
+    import sys
+    if "api.updates" in sys.modules:
+        assert on_disk.get("_webui_version") == sys.modules["api.updates"].WEBUI_VERSION
+
+    # Load returns the response-shape fields (stamps stripped) plus `aliases`,
+    # which the loader reconstructs from current config because the save path
+    # does not persist aliases on disk (keeps /model <alias> resolution working
+    # on a disk-cache hit). No config aliases here, so it reconstructs to {}.
+    loaded = config._load_models_cache_from_disk()
+    assert loaded == {**payload, "aliases": {}}
 
 
 def test_load_models_cache_from_disk_rejects_legacy_groups_only_cache(tmp_path, monkeypatch):
@@ -67,6 +85,7 @@ def test_load_models_cache_from_disk_rejects_partial_metadata_cache(
     valid_payload = {
         "active_provider": "openai",
         "default_model": "gpt-5.4-mini",
+        "configured_model_badges": {},
         "groups": [
             {
                 "provider": "OpenAI",
@@ -80,9 +99,11 @@ def test_load_models_cache_from_disk_rejects_partial_metadata_cache(
         {key: value for key, value in valid_payload.items() if key != "active_provider"},
         {key: value for key, value in valid_payload.items() if key != "default_model"},
         {key: value for key, value in valid_payload.items() if key != "groups"},
+        {key: value for key, value in valid_payload.items() if key != "configured_model_badges"},
         {**valid_payload, "active_provider": 123},
         {**valid_payload, "default_model": None},
         {**valid_payload, "groups": {}},
+        {**valid_payload, "configured_model_badges": []},
     ]
 
     for payload in invalid_payloads:

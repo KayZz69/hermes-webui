@@ -56,14 +56,23 @@ class TestMediaDiffInline:
         """loadDiffInline() function should be defined."""
         with open("static/ui.js", "r", encoding="utf-8") as f:
             content = f.read()
-        assert "function loadDiffInline()" in content
+        assert "function loadDiffInline" in content
 
     def test_loadDiffInline_called_in_post_render(self):
-        """loadDiffInline() should be called in post-render (after addCopyButtons)."""
+        """loadDiffInline() should be called by the consolidated post-render pass."""
         with open("static/ui.js", "r", encoding="utf-8") as f:
             content = f.read()
-        count = content.count("loadDiffInline()")
-        assert count >= 2, f"loadDiffInline() called {count} times, expected >= 2 (cached + fresh render)"
+        # Behavior assertion (#5338): post-render scheduled via
+        # _postProcessWithAnchorSuppression, which still calls postProcessRenderedMessages.
+        assert "requestAnimationFrame(()=>_postProcessWithAnchorSuppression(" in content
+        _wrap = content.find('function _postProcessWithAnchorSuppression')
+        assert _wrap != -1, "post-render should be wrapped by _postProcessWithAnchorSuppression"
+        assert 'postProcessRenderedMessages(container)' in content[_wrap:_wrap + 500], \
+            "the wrapper must still invoke postProcessRenderedMessages"
+        start = content.find("function postProcessRenderedMessages")
+        body = content[start:start + 500]
+        assert "addCopyButtons(container)" in body
+        assert "loadDiffInline(container)" in body
 
     def test_diff_inline_error_class(self):
         """Should have error state class."""
@@ -97,4 +106,4 @@ class TestDiffI18n:
         with open("static/i18n.js", "r", encoding="utf-8") as f:
             content = f.read()
         count = content.count("diff_loading")
-        assert count == 7, f"diff_loading found {count} times, expected 7"
+        assert count >= 8, f"diff_loading found {count} times, expected >= 8 (one per locale)"

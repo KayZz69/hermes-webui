@@ -112,7 +112,12 @@ class TestPeriodicCheckpoint:
     """
 
     def test_checkpoint_fires_on_activity_counter_increment(self):
-        """Checkpoint saves when _checkpoint_activity counter grows."""
+        """Checkpoint saves when _checkpoint_activity counter grows.
+
+        Deterministic: instead of relying on time-based polling windows, we
+        wait for the checkpoint thread's save_count to advance after each
+        increment. Generous timeout guards against CI scheduling jitter.
+        """
         s = _make_session("ckpt1")
         s.pending_user_message = "do a long task"
         s.save()  # initial save (like routes.py does before streaming starts)
@@ -120,28 +125,38 @@ class TestPeriodicCheckpoint:
         stop_event = threading.Event()
         _checkpoint_activity = [0]
         save_count = [0]
+        save_event = threading.Event()
 
         def periodic_checkpoint():
             last = 0
-            while not stop_event.wait(0.1):  # fast interval for test
+            while not stop_event.wait(0.02):  # fast poll for low-jitter test
                 try:
                     cur = _checkpoint_activity[0]
                     if cur > last:
                         s.save(skip_index=True)
                         last = cur
                         save_count[0] += 1
+                        save_event.set()
                 except Exception:
                     pass
 
         t = threading.Thread(target=periodic_checkpoint, daemon=True)
         t.start()
 
-        # Simulate on_tool() completing twice (as would happen during a real agent run)
-        time.sleep(0.15)
+        def _wait_for_save(target_count, timeout=3.0):
+            """Wait until save_count[0] >= target_count, or timeout."""
+            deadline = time.monotonic() + timeout
+            while save_count[0] < target_count and time.monotonic() < deadline:
+                save_event.wait(timeout=0.05)
+                save_event.clear()
+            return save_count[0] >= target_count
+
+        # Simulate on_tool() completing twice
         _checkpoint_activity[0] += 1  # first tool completes
-        time.sleep(0.25)
+        assert _wait_for_save(1), f"Expected 1 save after first increment; got {save_count[0]}"
+
         _checkpoint_activity[0] += 1  # second tool completes
-        time.sleep(0.25)
+        assert _wait_for_save(2), f"Expected 2 saves after second increment; got {save_count[0]}"
 
         stop_event.set()
         t.join(timeout=2)
@@ -299,10 +314,10 @@ class TestIssue765FollowupHardening:
         t2.join(timeout=5)
 
         assert not errors, f"Concurrent same-session saves should not fail: {errors}"
-        assert len(replace_sources) == 2, f"Expected 2 replace calls, got {replace_sources}"
+        assert len(replace_sources) >= 2, f"Expected replace calls, got {replace_sources}"
         assert len(set(replace_sources)) == 2, (
-            "Concurrent same-session saves must use distinct temp files; "
-            f"got {replace_sources}"
+            "Concurrent same-session saves must use distinct temp files even if Windows-safe "
+            f"replace retries one of them; got {replace_sources}"
         )
         data = json.loads(s.path.read_text(encoding="utf-8"))
         assert data["session_id"] == "same_sid"
@@ -318,15 +333,18 @@ class TestIssue765FollowupHardening:
         )
         stop_idx = src.find("if _checkpoint_stop is not None:\n                _checkpoint_stop.set()")
         join_idx = src.find("if _ckpt_thread is not None:\n                _ckpt_thread.join(timeout=15)")
-        lock_idx = src.find("with _agent_lock:\n                _result_messages =")
-        save_idx = src.find("s.context_messages = _next_context_messages")
+        lock_idx = src.find(
+            "with _agent_lock:\n"
+            "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+        )
+        save_idx = src.find("_result_messages = _settle_result_messages(")
 
         assert stop_idx != -1, "Success path must stop the checkpoint thread"
         assert join_idx != -1, "Success path must join the checkpoint thread"
         assert lock_idx != -1, "Success path must serialize mutation with _agent_lock"
-        assert save_idx != -1, "Success path restore/mutation block not found"
+        assert save_idx != -1, "Success path settlement block not found"
         assert stop_idx < join_idx < lock_idx <= save_idx, (
-            "Checkpoint stop/join must happen before the success-path session mutation block"
+            "Checkpoint stop/join must happen before the success-path settlement block"
         )
 
     def test_silent_failure_path_does_not_reacquire_agent_lock(self):
@@ -338,8 +356,13 @@ class TestIssue765FollowupHardening:
         src = (Path(__file__).parent.parent / "api" / "streaming.py").read_text(
             encoding="utf-8"
         )
-        outer_lock_idx = src.find("with _agent_lock:\n                _result_messages =")
-        silent_failure_idx = src.find("if not _assistant_added and not _token_sent:")
+        outer_lock_idx = src.find(
+            "with _agent_lock:\n"
+            "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+        )
+        silent_failure_idx = src.find(
+            "if _terminal_failure or (not _assistant_added and not _token_sent):"
+        )
         inner_lock_idx = src.find("with _agent_lock:", outer_lock_idx + 1)
         compression_idx = src.find("# ── Handle context compression side effects ──")
 
@@ -444,14 +467,17 @@ class TestIssue765FollowupHardening:
         )
         fn_idx = src.find("def _run_background_title_update(")
         assert fn_idx != -1, "_run_background_title_update not found"
-        fn_block = src[fn_idx:fn_idx + 3200]
+        fn_block = src[fn_idx:fn_idx + 4200]
         assert "with LOCK:" in fn_block, (
             "_run_background_title_update must acquire LOCK before rebinding "
             "to canonical cached session instance"
         )
-        assert "s = SESSIONS.get(session_id, s)" in fn_block, (
-            "_run_background_title_update must rebind to canonical cached "
-            "session instance under LOCK"
+        assert "cached_session = SESSIONS.get(session_id)" in fn_block, (
+            "_run_background_title_update must read the cached session under LOCK"
+        )
+        assert "getattr(cached_session, 'session_id', None) == session_id" in fn_block, (
+            "_run_background_title_update must only rebind to a canonical cached "
+            "session instance whose id matches the requested session"
         )
 
     def test_cancel_stream_uses_agent_lock(self):

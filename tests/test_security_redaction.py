@@ -3,7 +3,7 @@ Security tests: credential redaction in API responses.
 
 Verifies that credentials (GitHub PATs, API keys, etc.) are masked in:
   - GET /api/session  (messages and tool_calls)
-  - GET /api/memory   (MEMORY.md and USER.md content)
+ - GET /api/memory (MEMORY.md, USER.md, and SOUL.md content)
   - GET /api/session/export (downloaded JSON)
   - SSE done event    (session payload in stream)
 
@@ -11,8 +11,10 @@ Tests run against the isolated test test_server on port 8788.
 """
 
 import json
+import importlib
 import pathlib
 import sys
+import types
 import urllib.request
 import urllib.error
 import pytest
@@ -105,6 +107,252 @@ def test_redact_value_list():
     assert result[1]["content"] == "safe text"
 
 
+def test_redact_text_skips_full_redactor_for_safe_text(monkeypatch):
+    """Large ordinary transcript text should not pay the full redactor pass."""
+    import api.helpers as helpers
+
+    calls = []
+    monkeypatch.setattr(helpers, "_redact_fn_cached", lambda text: calls.append(text) or text)
+
+    safe_text = "ordinary session transcript without credential markers\n" * 500
+    assert helpers._redact_text(safe_text, _enabled=True) == safe_text
+    assert calls == []
+
+
+def test_redact_text_still_runs_full_redactor_for_sensitive_markers(monkeypatch):
+    """The cheap prefilter must preserve the hard redaction boundary."""
+    import api.helpers as helpers
+
+    calls = []
+
+    def fake_redactor(text):
+        calls.append(text)
+        return text.replace(_FAKE_SK_KEY, "sk-Tes...cdef")
+
+    monkeypatch.setattr(helpers, "_redact_fn_cached", fake_redactor)
+
+    result = helpers._redact_text(f"token={_FAKE_SK_KEY}", _enabled=True)
+
+    assert _FAKE_SK_KEY not in result
+    assert calls == [f"token={_FAKE_SK_KEY}"]
+
+
+@pytest.mark.parametrize("prefix,suffix", [
+    ("sk-", "TestCredential1234567890"),
+    ("ghp_", "TestCredential1234567890"),
+    ("github_pat_", "TestCredential_1234567890"),
+    ("gho_", "TestCredential1234567890"),
+    ("ghu_", "TestCredential1234567890"),
+    ("ghs_", "TestCredential1234567890"),
+    ("ghr_", "TestCredential1234567890"),
+    ("xoxb-", "TestCredential1234567890"),
+    ("xoxa-", "TestCredential1234567890"),
+    ("xoxp-", "TestCredential1234567890"),
+    ("xoxr-", "TestCredential1234567890"),
+    ("xoxs-", "TestCredential1234567890"),
+    ("AIza", "TestCredential1234567890abcdefghi"),
+    ("pplx-", "TestCredential1234567890"),
+    ("fal_", "TestCredential1234567890"),
+    ("fc-", "TestCredential1234567890"),
+    ("bb_live_", "TestCredential1234567890"),
+    ("gAAAA", "TestCredential1234567890abcd"),
+    ("AKIA", "TESTCREDENTIAL12"),
+    ("sk_" + "live_", "TestCredential1234567890"),
+    ("sk_" + "test_", "TestCredential1234567890"),
+    ("rk_" + "live_", "TestCredential1234567890"),
+    ("SG.", "TestCredential1234567890"),
+    ("hf_", "TestCredential1234567890"),
+    ("r8_", "TestCredential1234567890"),
+    ("npm_", "TestCredential1234567890"),
+    ("pypi-", "TestCredential1234567890"),
+    ("dop_v1_", "TestCredential1234567890"),
+    ("doo_v1_", "TestCredential1234567890"),
+    ("am_", "TestCredential1234567890"),
+    ("sk_", "TestCredential1234567890"),
+    ("tvly-", "TestCredential1234567890"),
+    ("exa_", "TestCredential1234567890"),
+    ("gsk_", "TestCredential1234567890"),
+    ("syt_", "TestCredential1234567890"),
+    ("retaindb_", "TestCredential1234567890"),
+    ("hsk-", "TestCredential1234567890"),
+    ("mem0_", "TestCredential1234567890"),
+    ("brv_", "TestCredential1234567890"),
+])
+def test_redact_text_prefilter_covers_known_prefixed_credentials(prefix, suffix):
+    """Every known prefix must still reach the hard redactor."""
+    import api.helpers as helpers
+
+    token = prefix + suffix
+    result = helpers._redact_text(f"credential={token}", _enabled=True)
+
+    assert token not in result
+
+
+@pytest.mark.parametrize("text", [
+    # OAuth callback URL with `code=` query param
+    "https://example.com/callback?code=AUTH_OPAQUE_VALUE",
+    # URL userinfo (user:password embedded in scheme://)
+    "https://admin:supersecretpassword@api.example.com/v1",
+    # Signed-URL sensitive query param
+    "https://cdn.example.com/file.zip?signature=ABCDEFGHIJKL",
+    # Session-token query param
+    "https://example.com/dashboard?session=xyzABC999DEF",
+    # WebSocket URL with token query param
+    "wss://example.com/ws?token=jwt_ABCDEFGHIJ",
+    # FTP userinfo
+    "ftp://user:pwd@files.example.com/path",
+])
+def test_redact_text_prefilter_routes_url_containing_strings_to_hard_redactor(text):
+    """Stage-348 Opus follow-up to PR #2171: the credential prefilter must
+    catch URL userinfo and sensitive query params so they still reach the
+    hard agent redactor instead of bypassing it.
+
+    Pre-fix, the prefilter only listed specific DB scheme prefixes
+    (postgres://, mysql://, etc.) and a closed set of form keys, so OAuth
+    callback URLs pasted into chat could pass through to the response
+    verbatim. The fix adds the generic "://" marker so http(s)/ws(s)/ftp
+    URLs always route to the hard redactor.
+
+    We test the *prefilter routing decision* here — `_might_contain_sensitive_text`
+    must return True for any URL-shaped string — rather than asserting on the
+    specific output of the agent redactor (which varies between hermes-agent
+    versions and CI vs local installs).
+    """
+    import api.helpers as helpers
+
+    assert helpers._might_contain_sensitive_text(text) is True, (
+        f"URL-shaped string {text!r} should route to hard redactor but the "
+        f"prefilter rejected it. Pre-fix this allowed OAuth callback URLs, "
+        f"URL userinfo, and signed-URL query params to bypass redaction."
+    )
+
+
+def test_redact_text_prefilter_admits_plain_text_without_url_or_credentials():
+    """Stage-348 follow-up companion: plain text with no URL or credential
+    marker still bypasses the hard redactor (the prefilter's whole purpose
+    is to skip the expensive pass when no markers are present)."""
+    import api.helpers as helpers
+
+    assert helpers._might_contain_sensitive_text("Hi how are you today?") is False
+    assert helpers._might_contain_sensitive_text("The user said 'hello'") is False
+    assert helpers._might_contain_sensitive_text("") is False
+    assert helpers._might_contain_sensitive_text(None) is False  # type: ignore[arg-type]
+
+
+def test_redact_value_works_with_legacy_agent_redact_signature(monkeypatch):
+    """_redact_text must tolerate older redact_sensitive_text(text) signatures."""
+    fake_agent = types.ModuleType("agent")
+    fake_redact = types.ModuleType("agent.redact")
+
+    def _legacy_redact_sensitive_text(text):
+        return text
+
+    fake_redact.redact_sensitive_text = _legacy_redact_sensitive_text
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.redact", fake_redact)
+
+    import api.helpers as helpers
+    helpers = importlib.reload(helpers)
+    try:
+        result = helpers._redact_value(f"token={_FAKE_GITHUB_PAT}")
+        assert _FAKE_GITHUB_PAT not in result
+        assert "ghp_Te" in result
+    finally:
+        importlib.reload(helpers)
+
+
+def test_redaction_preserves_secret_key_literals_in_code_without_values():
+    import api.helpers as helpers
+
+    key = "DISCORD" + "_BOT" + "_TOKEN"
+    snippet = (
+        f'if line.startswith("{key}="):\n'
+        '    return line.split("=", 1)[1].strip()'
+    )
+
+    assert helpers._redact_value(snippet) == snippet
+
+
+def test_redaction_masks_authorization_bot_value_without_breaking_code_structure():
+    import ast
+    import api.helpers as helpers
+
+    token = "M" + ("T" * 40) + ".abc123"
+    snippet = (
+        'headers = ["-H", '
+        f'f"Authorization: Bot {token}", '
+        '"-H", "User-Agent: HermesBot/1.0"]'
+    )
+
+    redacted = helpers._redact_value(snippet)
+
+    assert token not in redacted
+    assert 'f"Authorization: Bot ' in redacted
+    assert '", "-H", "User-Agent: HermesBot/1.0"]' in redacted
+    ast.parse(redacted)
+
+
+def _reload_helpers_with_fallback_redactor(monkeypatch):
+    fake_agent = types.ModuleType("agent")
+    fake_redact = types.ModuleType("agent.redact")
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.redact", fake_redact)
+
+    import api.helpers as helpers
+    return importlib.reload(helpers)
+
+
+@pytest.mark.parametrize("text,leaked", [
+    ("API_KEY=val,with,commas", "val,with,commas"),
+    ('TOKEN="quoted"', "quoted"),
+    ("PASSWORD=ends)", "ends)"),
+])
+def test_fallback_env_redaction_masks_values_with_delimiters(monkeypatch, text, leaked):
+    helpers = _reload_helpers_with_fallback_redactor(monkeypatch)
+    try:
+        redacted = helpers._redact_value(text)
+        assert leaked not in redacted
+        assert "..." in redacted or "***" in redacted
+    finally:
+        importlib.reload(helpers)
+
+
+def test_agent_redaction_restore_is_occurrence_aware_for_code_key_literals(monkeypatch):
+    key = "DISCORD" + "_BOT" + "_TOKEN"
+    secret = "real-secret-value-123456789"
+    mask = "real-s...6789"
+    original = (
+        f"env line: {key}={secret}\n"
+        f'if line.startswith("{key}="):\n'
+        "    return True"
+    )
+
+    fake_agent = types.ModuleType("agent")
+    fake_redact = types.ModuleType("agent.redact")
+
+    def _fake_redact_sensitive_text(text, force=True):
+        assert force is True
+        return (
+            text
+            .replace(f"{key}={secret}", f"{key}={mask}")
+            .replace(f'{key}="):', f"{key}={mask}")
+        )
+
+    fake_redact.redact_sensitive_text = _fake_redact_sensitive_text
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.redact", fake_redact)
+
+    import api.helpers as helpers
+    helpers = importlib.reload(helpers)
+    try:
+        redacted = helpers._redact_value(original)
+        assert secret not in redacted
+        assert f'if line.startswith("{key}="):' in redacted
+        assert f"env line: {key}=\"):" not in redacted
+    finally:
+        importlib.reload(helpers)
+
+
 def test_redact_session_data_messages():
     """redact_session_data masks credentials in messages[]."""
     from api.helpers import redact_session_data
@@ -126,6 +374,54 @@ def test_redact_session_data_messages():
     # Safe fields remain intact
     assert result["session_id"] == "abc123"
     assert result["messages"][1]["content"] == "sure"
+
+def test_redact_session_data_todo_state_sidecar():
+    """redact_session_data masks credentials in derived todo_state sidecars."""
+    from api.helpers import redact_session_data
+    session = {
+        "session_id": "todo-redact",
+        "messages": [],
+        "tool_calls": [],
+        "todo_state": {
+            "todos": [
+                {"id": "1", "content": f"rotate api key {_FAKE_SK_KEY}", "status": "pending"},
+            ],
+            "summary": {"total": 1, "pending": 1},
+            "version": 1,
+        },
+    }
+    result = redact_session_data(session)
+    dump = json.dumps(result)
+    _assert_no_plaintext_credentials(dump, "todo_state redaction")
+    assert result["todo_state"]["todos"][0]["status"] == "pending"
+
+
+def test_redact_session_data_runtime_journal_snapshot():
+    """redact_session_data masks credentials in active run-journal snapshots."""
+    from api.helpers import redact_session_data
+    session = {
+        "session_id": "journal-redact",
+        "messages": [],
+        "tool_calls": [],
+        "runtime_journal_snapshot": {
+            "messages": [
+                {"role": "assistant", "content": f"token echoed: {_FAKE_GITHUB_PAT}"},
+            ],
+            "tool_calls": [
+                {
+                    "name": "terminal",
+                    "preview": f"using {_FAKE_SK_KEY}",
+                    "args": {"command": f"export TOKEN={_FAKE_GITHUB_PAT}"},
+                },
+            ],
+            "last_assistant_text": f"assistant saw {_FAKE_HF_TOKEN}",
+            "last_reasoning_text": f"reasoning saw {_FAKE_AWS_KEY}",
+        },
+    }
+    result = redact_session_data(session)
+    dump = json.dumps(result)
+    _assert_no_plaintext_credentials(dump, "runtime_journal_snapshot redaction")
+    assert result["runtime_journal_snapshot"]["tool_calls"][0]["name"] == "terminal"
 
 
 def test_redact_session_data_multiple_cred_types():
@@ -161,7 +457,7 @@ def test_redact_session_data_non_sensitive_unchanged():
 
 
 # ── API-level tests (require running test server started by conftest.py) ─────
-# Run via `start.sh && pytest tests/test_security_redaction.py -v`
+# Run via `./scripts/test.sh tests/test_security_redaction.py -v`
 
 def _create_session_with_credentials() -> str:
     """Write a session file with credential-containing messages directly to disk.
@@ -291,12 +587,19 @@ def test_fix_credential_permissions_corrects_loose_files(tmp_path, monkeypatch):
     fix_credential_permissions()
 
     import stat
-    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600, ".env not fixed to 600"
-    assert stat.S_IMODE(google_file.stat().st_mode) == 0o600, "google_token.json not fixed to 600"
+    assert env_file.exists(), ".env missing after permission repair"
+    assert google_file.exists(), "google_token.json missing after permission repair"
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600, ".env not fixed to 600"
+        assert stat.S_IMODE(google_file.stat().st_mode) == 0o600, "google_token.json not fixed to 600"
+    # Windows CI cannot assert a POSIX mode-bit repair here; keeping the files
+    # present after the repair pass is the strongest portable contract for now.
 
 
 def test_fix_credential_permissions_skips_correct_files(tmp_path, monkeypatch):
     """fix_credential_permissions() does not alter already-strict files."""
+    import os
+
     env_file = tmp_path / ".env"
     env_file.write_text("SECRET=abc")
     env_file.chmod(0o600)
@@ -307,4 +610,6 @@ def test_fix_credential_permissions_skips_correct_files(tmp_path, monkeypatch):
     fix_credential_permissions()
 
     import stat
-    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert env_file.exists(), ".env missing after strict-permission check"
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600

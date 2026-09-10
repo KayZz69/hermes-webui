@@ -13,7 +13,7 @@ def test_index_contains_onboarding_overlay_markup():
     assert 'id="onboardingOverlay"' in html
     assert 'id="onboardingBody"' in html
     assert 'id="onboardingNextBtn"' in html
-    assert 'src="static/onboarding.js"' in html
+    assert 'src="static/onboarding.js?v=__WEBUI_VERSION__"' in html
 
 
 def test_onboarding_css_rules_exist():
@@ -49,10 +49,26 @@ def test_onboarding_uses_i18n_helpers():
     assert "onboarding_title: 'Bienvenido a Hermes Web UI'" in i18n
 
 
+def test_onboarding_provider_notice_uses_i18n_key():
+    js = read("static/onboarding.js")
+    py = read("api/onboarding.py")
+    assert '"provider_note_key": note_key' in py
+    assert '"provider_note_args": note_args' in py
+    assert "function _localizedOnboardingProviderNote(system)" in js
+    assert "Array.isArray(system&&system.provider_note_args)" in js
+    assert "t(key,...args)" in js
+    assert "!/\\{\\d+\\}/.test(localized)" in js
+    assert "system.provider_note|| (setupOk?" not in js
+
+
 def test_bootstrap_script_contains_official_installer_and_windows_guard():
     src = read("bootstrap.py")
     assert (
         "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
         in src
     )
-    assert "Native Windows is not supported" in src
+    # Native Windows is now experimental-supported (#1952), not hard-blocked:
+    # ensure_supported_platform() warns instead of raising, but auto-install
+    # (which shells out to /bin/bash) still guards native Windows explicitly.
+    assert "Native Windows bootstrap is experimental" in src
+    assert "Auto-install is not supported on native Windows" in src

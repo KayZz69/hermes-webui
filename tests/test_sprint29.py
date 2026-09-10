@@ -18,6 +18,7 @@ Covers:
 import importlib
 import json
 import pathlib
+import pytest
 import sys
 import time
 import urllib.error
@@ -62,6 +63,21 @@ def get_raw_with_headers(path):
 
 
 class TestCSRF:
+    @pytest.fixture(autouse=True)
+    def _disable_auth_for_origin_unit_checks(self, monkeypatch):
+        """Keep origin/port CSRF checks isolated from auth stateful tests.
+
+        These Sprint 29 cases predate session-bound CSRF tokens and exercise
+        only Origin/Referer/Host allow/deny behavior. If an earlier test leaves
+        password auth enabled in the shared pytest process, _check_csrf also
+        requires a valid session CSRF token and these origin-only assertions
+        become order-dependent. Auth-enabled token coverage lives in
+        test_issue1909_csrf_token.py.
+        """
+        import api.auth as auth
+
+        monkeypatch.setattr(auth, "is_auth_enabled", lambda: False)
+
     @staticmethod
     def _csrf_allowed(headers):
         from types import SimpleNamespace
@@ -103,7 +119,7 @@ class TestCSRF:
         )
         assert status != 403, f"Expected non-403 for same-referer request, got {status}"
 
-    def test_proxy_host_default_https_port_matches_http_origin(self):
+    def test_proxy_host_default_https_port_matches_http_origin(self, monkeypatch):
         """http:// origin without port must NOT match X-Forwarded-Host with :443.
 
         After the scheme-aware _ports_match fix: http:// absent port = :80,
@@ -113,20 +129,23 @@ class TestCSRF:
         See test_proxy_host_default_https_port_matches_https_origin for the
         real-world proxy case that should pass.
         """
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_HOST", "1")
         assert not self._csrf_allowed({
             "Origin": "http://example.com",
             "X-Forwarded-Host": "example.com:443",
         }), 'http origin (port :80) must not match https host (:443)'
 
-    def test_proxy_host_default_https_port_matches_https_origin(self):
+    def test_proxy_host_default_https_port_matches_https_origin(self, monkeypatch):
         """HTTPS Origin without port should match X-Forwarded-Host with explicit :443."""
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_HOST", "1")
         assert self._csrf_allowed({
             "Origin": "https://example.com",
             "X-Forwarded-Host": "example.com:443",
         })
 
-    def test_proxy_host_port_normalization_still_rejects_other_host(self):
+    def test_proxy_host_port_normalization_still_rejects_other_host(self, monkeypatch):
         """Port normalization must not allow different hosts through."""
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_HOST", "1")
         assert not self._csrf_allowed({
             "Origin": "https://evil.com",
             "X-Forwarded-Host": "example.com:443",
@@ -152,19 +171,21 @@ class TestCSRF:
 
     # ── Port normalization: scheme-aware (M-1 fix) ────────────────────────────
 
-    def test_cross_protocol_port_not_confused_http_origin_https_host(self):
+    def test_cross_protocol_port_not_confused_http_origin_https_host(self, monkeypatch):
         """http:// origin must NOT match a host with :443 (HTTPS default).
 
         Before M-1 fix, _ports_match treated both 80 and 443 as equivalent to
         absent port, allowing http://host to match https://host:443 servers.
         """
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_HOST", "1")
         assert not self._csrf_allowed({
             'Origin': 'http://example.com',     # http, no port = :80
             'X-Forwarded-Host': 'example.com:443',  # HTTPS port
         }), 'http origin should NOT match host advertising port 443'
 
-    def test_cross_protocol_port_not_confused_https_origin_http_host(self):
+    def test_cross_protocol_port_not_confused_https_origin_http_host(self, monkeypatch):
         """https:// origin must NOT match a host with :80 (HTTP default)."""
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_HOST", "1")
         assert not self._csrf_allowed({
             'Origin': 'https://example.com',    # https, no port = :443
             'X-Forwarded-Host': 'example.com:80',   # HTTP port
@@ -472,13 +493,13 @@ class TestSecureCookieFlag:
 
 
 class TestHMACLength:
-    def test_session_token_sig_is_32_chars(self):
-        """Session cookie signature must be 32 hex chars (128-bit), not 16."""
+    def test_session_token_sig_is_64_chars(self):
+        """Session cookie signature must be 64 hex chars (256-bit), not 32."""
         from api.auth import create_session
         cookie = create_session()
         token, sig = cookie.rsplit('.', 1)
-        assert len(sig) == 32, \
-            f"Expected 32-char signature (128-bit), got {len(sig)}: {sig}"
+        assert len(sig) == 64, \
+            f"Expected 64-char signature (SHA-256), got {len(sig)}: {sig}"
 
     def test_verify_session_rejects_old_16char_sig(self):
         """A cookie with a 16-char sig must fail verification."""
@@ -522,6 +543,12 @@ class TestSkillsPathTraversal:
         # Should succeed (200) or need auth (401/403) — not path error (400)
         assert status in (200, 401, 403, 404), \
             f"Valid skill save got unexpected status {status}: {body}"
+        # Clean up the saved skill so it doesn't pollute later tests'
+        # SKILLS_DIR enumeration (sprint3 skills tests in particular).
+        try:
+            post("/api/skills/delete", {"name": "test-security-skill"})
+        except Exception:
+            pass
 
 
 # ── 8. Content-Disposition for Dangerous MIME Types ───────────────────────
@@ -706,11 +733,31 @@ class TestSSRFCheck:
 
 class TestENVLock:
     def test_env_lock_importable_from_streaming(self):
-        """_ENV_LOCK must be importable from api.streaming."""
+        """_ENV_LOCK must be an importable threading-style lock.
+
+        Stage-360 maintainer fix: _ENV_LOCK MUST be non-reentrant
+        (threading.Lock, not RLock) — see QA test_env_lock_is_non_reentrant.
+        RLock would mask the deadlock pattern that the lock is designed to
+        catch. Background workers that need profile env should use the
+        narrow-lock pattern in profile_env_for_background_worker() rather
+        than relying on reentrance.
+        """
         from api.streaming import _ENV_LOCK
-        import threading
-        assert isinstance(_ENV_LOCK, type(threading.Lock())), \
-            "_ENV_LOCK must be a threading.Lock"
+
+        assert hasattr(_ENV_LOCK, "acquire"), "_ENV_LOCK must expose acquire()"
+        assert hasattr(_ENV_LOCK, "release"), "_ENV_LOCK must expose release()"
+        assert hasattr(_ENV_LOCK, "__enter__"), "_ENV_LOCK must support context manager use"
+        assert hasattr(_ENV_LOCK, "__exit__"), "_ENV_LOCK must support context manager use"
+
+        # Verify non-reentrance: a same-thread second acquire(blocking=False)
+        # while the lock is held must fail. This invariant matters because
+        # it catches a class of deadlock bugs early.
+        with _ENV_LOCK:
+            acquired_again = _ENV_LOCK.acquire(False)
+            assert not acquired_again, (
+                "_ENV_LOCK must be non-reentrant (threading.Lock, not RLock). "
+                "See QA test_env_lock_is_non_reentrant for the architectural reason."
+            )
 
     def test_env_lock_importable_in_routes(self):
         """api.routes must be able to import _ENV_LOCK from api.streaming."""
@@ -721,8 +768,6 @@ class TestENVLock:
 
 
 # ── Fixture ────────────────────────────────────────────────────────────────
-
-import pytest
 
 
 @pytest.fixture(scope="module")

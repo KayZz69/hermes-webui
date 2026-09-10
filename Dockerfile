@@ -21,13 +21,34 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     apt-utils \
     locales \
     ca-certificates \
-    sudo \
     curl \
     rsync \
     openssh-client \
+    git \
+    xz-utils \
     && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Optional GPU user-space acceleration libraries for users who pass through
+# host GPU devices. The default image remains CPU-only.
+ARG INSTALL_GPU_LIBS=0
+RUN if [ "$INSTALL_GPU_LIBS" = "1" ]; then \
+        apt-get update -y --fix-missing --no-install-recommends \
+        && apt-get install -y --no-install-recommends \
+            libva2 \
+            vainfo \
+            mesa-va-drivers \
+        && if apt-cache show intel-media-va-driver-non-free >/dev/null 2>&1; then \
+            apt-get install -y --no-install-recommends intel-media-va-driver-non-free; \
+        else \
+            echo "intel-media-va-driver-non-free is not available from the configured Debian repositories; skipping Intel non-free VA-API driver."; \
+        fi \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "Skipping optional GPU user-space acceleration libraries (INSTALL_GPU_LIBS=0)."; \
+    fi
 
 # UTF-8
 RUN localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
@@ -41,24 +62,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /apptoo
 
-# Every sudo group user does not need a password
-RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-
-# Create a new group for the hermeswebui and hermeswebuitoo users
-RUN groupadd -g 1024 hermeswebui \ 
-    && groupadd -g 1025 hermeswebuitoo
-
-# The hermeswebui (resp. hermeswebuitoo) user will have UID 1024 (resp. 1025), 
-# be part of the hermeswebui (resp. hermeswebuitoo) and users groups and be sudo capable (passwordless) 
-RUN useradd -u 1024 -d /home/hermeswebui -g hermeswebui -s /bin/bash -m hermeswebui \
-    && usermod -G users hermeswebui \
-    && adduser hermeswebui sudo
-RUN useradd -u 1025 -d /home/hermeswebuitoo -g hermeswebuitoo -s /bin/bash -m hermeswebuitoo \
-    && usermod -G users hermeswebuitoo \
-    && adduser hermeswebuitoo sudo
-RUN chown -R hermeswebuitoo:hermeswebuitoo /apptoo
-
-USER root
+# Create the unprivileged runtime user. The entrypoint starts as root only for
+# UID/GID alignment and filesystem preparation, then execs the server as this user.
+RUN groupadd -g 1024 hermeswebui \
+    && useradd -u 1024 -d /home/hermeswebui -g hermeswebui -G users -s /bin/bash -m hermeswebui \
+    && mkdir -p /app /uv_cache /workspace \
+    && chown -R hermeswebui:hermeswebui /home/hermeswebui /app /uv_cache /workspace \
+    && chmod 0755 /home/hermeswebui \
+    && chmod 1777 /app /uv_cache /workspace
 
 COPY --chmod=555 docker_init.bash /hermeswebui_init.bash
 
@@ -75,9 +86,7 @@ USER root
 # The init script will skip the download when uv is already on PATH.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-USER hermeswebuitoo
-
-COPY --chown=hermeswebuitoo:hermeswebuitoo . /apptoo
+COPY --chown=root:root . /apptoo
 
 # Bake the git version tag into the image so the settings badge works even
 # when .git is not present (it is excluded by .dockerignore).
@@ -92,5 +101,11 @@ ENV HERMES_WEBUI_PORT=8787
 
 EXPOSE 8787
 
+HEALTHCHECK --interval=30s --timeout=8s --start-period=10s --retries=3 \
+  CMD bash /apptoo/scripts/lib/health_probe.sh localhost 8787 /health 2 >/dev/null || exit 1
+
+# docker_init.bash performs root-only bind-mount setup, then drops to hermeswebui
+# before starting the WebUI server. The production image does not ship sudo.
+USER root
 CMD ["/hermeswebui_init.bash"]
 

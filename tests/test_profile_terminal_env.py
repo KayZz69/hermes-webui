@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -51,5 +52,82 @@ def test_streaming_applies_profile_runtime_env_to_agent_run():
 
     assert "get_profile_runtime_env" in src
     assert "_profile_runtime_env" in src
+    assert "_safe_profile_runtime_env" in src
     assert "old_profile_env" in src
-    assert "os.environ.update(_profile_runtime_env)" in src
+    assert "filter_runtime_env_for_gateway_parity" in src
+    assert "os.environ.update(_safe_profile_runtime_env)" in src
+    assert "os.environ.update(_profile_runtime_env)" not in src
+
+
+def test_filter_runtime_env_for_gateway_parity_blocks_shell_identity_vars():
+    from api.profiles import filter_runtime_env_for_gateway_parity
+
+    env = {
+        "HOME": "/tmp/fake-home",
+        "PATH": "/tmp/fake-bin:/usr/bin",
+        "PWD": "/tmp/fake-pwd",
+        "SHELL": "/bin/zsh",
+        "OPENAI_API_KEY": "test-key",
+        "TERMINAL_ENV": "ssh",
+        "TERMINAL_CWD": "/workspace",
+    }
+
+    filtered = filter_runtime_env_for_gateway_parity(env)
+
+    assert "HOME" not in filtered
+    assert "PATH" not in filtered
+    assert "PWD" not in filtered
+    assert "SHELL" not in filtered
+    assert filtered["OPENAI_API_KEY"] == "test-key"
+    assert filtered["TERMINAL_ENV"] == "ssh"
+    assert filtered["TERMINAL_CWD"] == "/workspace"
+
+
+def test_profile_background_worker_uses_gateway_parity_runtime_env_filter():
+    src = Path("api/profiles.py").read_text(encoding="utf-8")
+
+    assert "filter_runtime_env_for_gateway_parity" in src
+    assert "safe_runtime_env" in src
+    assert "os.environ.update(safe_runtime_env)" in src
+    assert "os.environ.update(runtime_env)" not in src
+
+
+def test_streaming_thread_env_allows_profile_terminal_cwd_override():
+    src = Path("api/streaming.py").read_text(encoding="utf-8")
+
+    assert "def _build_agent_thread_env" in src
+    assert "_thread_env = _build_agent_thread_env(" in src
+    assert "_set_thread_env(**_thread_env)" in src
+    assert "_set_thread_env(\n            **_profile_runtime_env,\n            TERMINAL_CWD" not in src
+
+    match = re.search(
+        r"(def _build_agent_thread_env\(.*?\n)(?=\ndef |\nclass )",
+        src,
+        re.DOTALL,
+    )
+    assert match, "_build_agent_thread_env not found in api/streaming.py"
+    ns: dict = {}
+    exec(compile(match.group(1), "<streaming_extract>", "exec"), ns)
+
+    env = ns["_build_agent_thread_env"](
+        {
+            "TERMINAL_CWD": "/profile/config/cwd",
+            "HERMES_EXEC_ASK": "0",
+            "HERMES_SESSION_KEY": "old-session",
+            "HERMES_SESSION_ID": "old-session",
+            "HERMES_SESSION_PLATFORM": "cli",
+            "HERMES_HOME": "/old/profile/home",
+            "TERMINAL_ENV": "ssh",
+        },
+        "/active/workspace",
+        "active-session",
+        "/active/profile/home",
+    )
+
+    assert env["TERMINAL_CWD"] == "/active/workspace"
+    assert env["HERMES_EXEC_ASK"] == "1"
+    assert env["HERMES_SESSION_KEY"] == "active-session"
+    assert env["HERMES_SESSION_ID"] == "active-session"
+    assert env["HERMES_SESSION_PLATFORM"] == "webui"
+    assert env["HERMES_HOME"] == "/active/profile/home"
+    assert env["TERMINAL_ENV"] == "ssh"

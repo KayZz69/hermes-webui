@@ -61,9 +61,8 @@ class TestApplyUpdateDiagnostics:
         from api import updates
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
-            # Call sequence: upstream query, fetch
+            # Call sequence: fetch
             mock_run_git.side_effect = [
-                ('origin/master', True),   # rev-parse @{upstream}
                 ('', False),               # fetch fails
             ]
             result = updates._apply_update_inner('webui')
@@ -80,12 +79,11 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),   # upstream query
                 ('', False),               # fetch fails
             ]
             updates._apply_update_inner('webui')
-            # Only 2 calls: upstream query + fetch. No pull call.
-            assert mock_run_git.call_count == 2
+            # Only fetch is called. No target selection or pull call.
+            assert mock_run_git.call_count == 1
 
     # ------------------------------------------------------------------
     # Path 2: pull fails + diverged history
@@ -99,8 +97,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),                          # upstream query
                 ('', True),                                       # fetch succeeds
+                ('', True),                                       # no release tags
+                ('origin/master', True),                          # upstream query
                 ('', True),                                       # status --porcelain (clean)
                 ('Not possible to fast-forward, aborting.', False),  # pull fails
             ]
@@ -119,8 +118,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/feat/my-feature', True),   # upstream query
                 ('', True),                         # fetch
+                ('', True),                         # no release tags
+                ('origin/feat/my-feature', True),   # upstream query
                 ('', True),                         # status (clean)
                 ('Your branch and origin have diverged.', False),  # pull
             ]
@@ -137,8 +137,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', True),
+                ('', True),
+                ('origin/master', True),
                 ('', True),
                 ('DIVERGED from upstream', False),
             ]
@@ -159,8 +160,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),                               # upstream query
                 ('', True),                                            # fetch
+                ('', True),                                            # no release tags
+                ('origin/master', True),                               # upstream query
                 ('', True),                                            # status (clean)
                 ('There is no tracking information for the current branch.', False),  # pull
             ]
@@ -178,8 +180,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', True),
+                ('', True),
+                ('origin/master', True),
                 ('', True),
                 ('fatal: The current branch local does not track a remote branch.', False),
             ]
@@ -196,8 +199,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/main', True),
                 ('', True),
+                ('', True),
+                ('origin/main', True),
                 ('', True),
                 ('no tracking information', False),
             ]
@@ -219,8 +223,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', True),
+                ('', True),
+                ('origin/master', True),
                 ('', True),
                 (long_error, False),
             ]
@@ -240,8 +245,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', True),
+                ('', True),
+                ('origin/master', True),
                 ('', True),
                 ('', False),   # pull fails with empty output
             ]
@@ -258,8 +264,9 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', True),
+                ('', True),
+                ('origin/master', True),
                 ('', True),
                 ('Some unrecognized git error', False),
             ]
@@ -285,8 +292,9 @@ class TestApplyUpdateDiagnostics:
              patch(f'{_MODULE}._update_cache', fake_cache), \
              patch(f'{_MODULE}._cache_lock'):
             mock_run_git.side_effect = [
-                ('origin/master', True),          # upstream query
                 ('', True),                       # fetch succeeds
+                ('', True),                       # no release tags
+                ('origin/master', True),          # upstream query
                 ('', True),                       # status (clean working tree)
                 ('Already up to date.', True),    # pull succeeds
             ]
@@ -306,7 +314,6 @@ class TestApplyUpdateDiagnostics:
         with patch(f'{_MODULE}._AGENT_DIR', tmp_path), \
              patch(f'{_MODULE}._run_git') as mock_run_git:
             mock_run_git.side_effect = [
-                ('origin/master', True),
                 ('', False),   # fetch fails
             ]
             result = updates._apply_update_inner('agent')
@@ -315,3 +322,34 @@ class TestApplyUpdateDiagnostics:
         assert 'could not reach' in result['message'].lower() or \
                'internet' in result['message'].lower() or \
                'remote' in result['message'].lower()
+
+
+# Issue #4085 regression: a dirty install at-or-past the latest release tag
+# must surface `dirty: True` on the check payload so the Settings panel can
+# offer `apply_force_update` instead of the silent "Up to date" state.
+class TestCheckRepoDirtyFlag:
+    def test_dirty_tree_surfaces_dirty_true(self, tmp_path):
+        """A dirty tree on a network-failed check must still carry dirty=True.
+
+        The Settings panel needs the dirty flag on every payload shape so a
+        user can always recover from a local-modifications state, even when
+        the latest remote cannot be reached.
+        """
+        (tmp_path / '.git').mkdir()
+
+        def fake_git(args, cwd, timeout=10):
+            if args == ['diff-index', '--quiet', 'HEAD', '--']:
+                return '', False  # dirty
+            if args == ['fetch', 'origin', '--tags', '--force']:
+                return 'network unavailable', False  # fail fast
+            if args == ['tag', '--list', 'v*', '--sort=-v:refname']:
+                return '', True
+            raise AssertionError(f'unexpected git args: {args!r}')
+
+        from api import updates
+        with patch(f'{_MODULE}._run_git', side_effect=fake_git):
+            info = updates._check_repo(tmp_path, 'webui')
+
+        assert info is not None
+        assert info['dirty'] is True
+        assert info['stale_check'] is True

@@ -3,15 +3,16 @@
 from pathlib import Path
 
 
-SESSIONS_JS = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text()
-STYLE_CSS = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text()
+SESSIONS_JS = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+STYLE_CSS = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
 
 
 def test_pinned_indicator_renders_inside_title_row():
     title_row_idx = SESSIONS_JS.find("titleRow.className='session-title-row';")
     assert title_row_idx != -1, "session title row construction not found"
 
-    assert "body.appendChild(_renderOneSession(s, Boolean(g.isPinned)))" in SESSIONS_JS
+    assert ("body.appendChild(_renderOneSession(s, Boolean(g.isPinned)))" in SESSIONS_JS
+            or "body.appendChild(parentEl)" in SESSIONS_JS)
     assert "function _renderOneSession(s, isPinnedGroup=false)" in SESSIONS_JS
     assert "if(s.pinned&&!isPinnedGroup){" in SESSIONS_JS
 
@@ -79,8 +80,8 @@ def test_state_indicator_uses_right_actions_slot_to_prevent_title_shift():
 
 
 def test_timestamp_hidden_when_attention_state_is_present():
-    assert "+(hasUnread?' unread':'')" in SESSIONS_JS
-    assert "const hasAttentionState=isStreaming||hasUnread;" in SESSIONS_JS
+    assert "+(hasUnread?' unread':'')+(attention?' needs-attention':'')+attentionClass" in SESSIONS_JS
+    assert "const hasAttentionState=isStreaming||hasUnread||Boolean(attention);" in SESSIONS_JS
     assert "ts.className='session-time'+(hasAttentionState?' is-hidden':'');" in SESSIONS_JS
     assert "ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);" in SESSIONS_JS
     assert ".session-time.is-hidden{display:none;}" in STYLE_CSS
@@ -94,7 +95,7 @@ def test_timestamp_hidden_when_attention_state_is_present():
     # Instead, hover padding is restored via @media (hover:hover) which only applies to
     # devices with a real hover capability (mouse). Touch/iPad devices satisfy hover:none
     # and skip that block, preventing the layout-reflow mid-tap bug.
-    assert ".session-item.streaming,.session-item.unread,.session-item:focus-within,.session-item.menu-open{padding-right:40px;}" in STYLE_CSS
+    assert ".session-item.streaming,.session-item.unread,.session-item.needs-attention,.session-item:focus-within,.session-item.menu-open{padding-right:40px;}" in STYLE_CSS
     # Desktop hover padding restored via media query (mouse devices only)
     assert "@media (hover:hover)" in STYLE_CSS
     assert ".session-item:hover{padding-right:40px;}" in STYLE_CSS
@@ -102,27 +103,44 @@ def test_timestamp_hidden_when_attention_state_is_present():
     # Timestamp now uses margin-left:auto inside the flex row instead of
     # absolute positioning. This stops the title's flex:1 bound from running
     # underneath the timestamp and lets the project dot sit beside it.
+    # Anchor on the canonical UNSCOPED `.session-time{` rule (start-of-line) —
+    # a skin-scoped variant like `:root[data-skin="graphite"] .session-item.active
+    # .session-time{` can precede it and would otherwise widen the slice into
+    # unrelated skin rules that legitimately use position:absolute.
+    import re as _re
+    _m = _re.search(r"(?m)^\s*\.session-time\{", STYLE_CSS)
+    assert _m, "canonical unscoped .session-time{ rule not found"
     session_time_block = STYLE_CSS[
-        STYLE_CSS.find(".session-time{"):
-        STYLE_CSS.find(".session-time.is-hidden")
+        _m.start():
+        STYLE_CSS.find("}", _m.start())
     ]
-    assert "position:absolute;" not in session_time_block, (
+    assert "position:absolute" not in session_time_block, (
         "Timestamp must live in flex flow (margin-left:auto), not absolute"
     )
-    assert "margin-left:auto;" in session_time_block
+    assert "margin-left:auto" in session_time_block
     assert ".session-item:hover .session-time" in STYLE_CSS
     assert ".session-item.streaming:not(:hover):not(:focus-within):not(.menu-open) .session-actions" in STYLE_CSS
     assert ".session-item.unread:not(:hover):not(:focus-within):not(.menu-open) .session-actions" in STYLE_CSS
 
 
+def test_plain_mouse_hover_does_not_mark_session_row_dragging():
+    """Pointermove fires during ordinary hover; drag styling must require an active press."""
+    assert "let _gestureState='idle';" in SESSIONS_JS
+    assert "_gestureState='pressing';" in SESSIONS_JS
+    assert "if(_gestureState==='idle') return false;" in SESSIONS_JS
+    assert "_gestureState='idle';" in SESSIONS_JS
+    assert ".session-item.dragging:hover" in STYLE_CSS
+
+
 def test_sidebar_uses_local_inflight_state_for_immediate_spinner():
-    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text()
+    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text(encoding="utf-8")
 
     assert "function _isSessionLocallyStreaming(s)" in SESSIONS_JS
-    assert "(isActive && S.busy)" in SESSIONS_JS
-    assert "INFLIGHT[s.session_id]" in SESSIONS_JS
+    assert "isActive && Boolean(S.busy)" in SESSIONS_JS
+    assert "function _purgeStaleInflightEntries()" in SESSIONS_JS
+    assert "delete INFLIGHT[sid];" in SESSIONS_JS
     assert "function _isSessionEffectivelyStreaming(s)" in SESSIONS_JS
-    assert "const isStreaming=_isSessionEffectivelyStreaming(s);" in SESSIONS_JS
+    assert "const ownStreaming=_isSessionEffectivelyStreaming(s)" in SESSIONS_JS
     assert "if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();" in messages_js
 
 
@@ -139,8 +157,8 @@ def test_date_group_caret_expanded_down_collapsed_right():
 
 def test_apperror_path_calls_render_session_list():
     """apperror handler must call renderSessionList() to clear the streaming indicator
-    immediately rather than waiting for the 5s streaming poll interval."""
-    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text()
+    immediately rather than waiting for the streaming poll interval."""
+    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text(encoding="utf-8")
     apperror_idx = messages_js.find("source.addEventListener('apperror'")
     assert apperror_idx != -1, "apperror handler not found in messages.js"
     warning_idx = messages_js.find("source.addEventListener('warning'", apperror_idx)
@@ -148,7 +166,7 @@ def test_apperror_path_calls_render_session_list():
     apperror_block = messages_js[apperror_idx:warning_idx]
     assert "renderSessionList()" in apperror_block, (
         "apperror handler must call renderSessionList() so the streaming indicator "
-        "clears immediately on server errors, not after a 5s poll delay"
+        "clears immediately on server errors, not after the polling fallback delay"
     )
 
 

@@ -36,11 +36,11 @@ def test_569_autodetect_before_usermod():
     detect_pos = INIT_SH.find("stat -c '%u'")
     if detect_pos == -1:
         detect_pos = INIT_SH.find("stat -c")
-    usermod_pos = INIT_SH.find("sudo usermod")
+    usermod_pos = INIT_SH.find("usermod -o -u")
     assert detect_pos != -1, "stat UID detection not found"
-    assert usermod_pos != -1, "sudo usermod not found"
+    assert usermod_pos != -1, "usermod not found"
     assert detect_pos < usermod_pos, (
-        "UID auto-detect must occur before 'sudo usermod' so the correct UID "
+        "UID auto-detect must occur before 'usermod' so the correct UID "
         "is used when remapping the hermeswebui user"
     )
 
@@ -127,12 +127,12 @@ def test_579_topbar_filters_tool_messages():
     sidebar count display entirely; the topbar was already correct.
     This test locks in the existing topbar filter so it can't regress.
     """
-    # Find the topbarMeta assignment
-    meta_pos = UI_JS.find("topbarMeta")
-    assert meta_pos != -1, "topbarMeta assignment not found in ui.js"
+    # Find the helper used by syncTopbar() to compute the topbar message count.
+    helper_pos = UI_JS.find("function _topbarLoadedMessageCount")
+    assert helper_pos != -1, "topbar message-count helper not found in ui.js"
 
-    # Find the filter that precedes it — should exclude role==='tool'
-    context = UI_JS[max(0, meta_pos - 400):meta_pos + 100]
+    # The helper must exclude role==='tool' from the loaded browser window.
+    context = UI_JS[helper_pos:helper_pos + 900]
     assert "role" in context and "tool" in context, (
         "topbarMeta count must filter by role — "
         "messages with role='tool' must be excluded from the displayed count"

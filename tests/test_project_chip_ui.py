@@ -166,3 +166,114 @@ class TestResizeProjectInputHelper:
         assert "addEventListener('input'" in body, (
             "_startProjectCreate must wire input events to _resizeProjectInput"
         )
+
+
+class TestProjectChipLongPressTouch:
+    """Mobile long-press to open the project context menu (#3760).
+
+    Project chips were deletable only via the right-click context menu, which has
+    no touch equivalent — so mobile users could never remove a project. A 500ms
+    long-press now opens the same menu.
+    """
+
+    def _chip_touch_block(self):
+        # The chip touch handlers live just after the oncontextmenu wiring in the
+        # project-chip render loop.
+        idx = SESSIONS_JS.find("Touch long-press")
+        assert idx != -1, "project-chip long-press touch block not found"
+        return SESSIONS_JS[idx: idx + 2300]
+
+    def test_long_press_opens_project_context_menu(self):
+        block = self._chip_touch_block()
+        assert "addEventListener('touchstart'" in block
+        assert "setTimeout(" in block and "},500);" in block
+        assert "_showProjectContextMenu(" in block
+        # visual feedback + scroll-drift cancel, mirroring the session-item pattern
+        assert "long-pressing" in block
+        assert "addEventListener('touchmove'" in block
+        assert ">10" in block  # >10px drift cancels the press
+
+    def test_long_press_suppresses_synthetic_click_and_filter_tap(self):
+        block = self._chip_touch_block()
+        # touchend must be non-passive so it can preventDefault the synthetic click
+        assert "addEventListener('touchend'" in block
+        assert "{passive:false}" in block
+        assert "e.preventDefault();e.stopPropagation();" in block
+        # the long-press handler cancels the pending single-tap filter timer
+        assert "clearTimeout(_pClickTimer)" in block
+
+    def test_touchstart_clears_inflight_timer_before_scheduling(self):
+        """Regression: a second finger / stray touchstart must not orphan the
+        prior timer (which would then fire the menu after the gesture was
+        cancelled). touchstart clears any in-flight _lpTimer before scheduling,
+        and the timer body bails if the gesture was already consumed.
+        """
+        block = self._chip_touch_block()
+        # clear-before-schedule at the top of touchstart
+        assert "if(_lpTimer){clearTimeout(_lpTimer);_lpTimer=null;}" in block, (
+            "touchstart must clear any in-flight long-press timer before scheduling "
+            "a new one (orphaned-timer fix)"
+        )
+        # stale-fire guard inside the timer body
+        assert "if(_lpHandled) return;" in block, (
+            "the long-press timer body must no-op if the gesture was already consumed"
+        )
+
+    def test_long_pressing_style_feedback_present(self):
+        assert ".project-chip.long-pressing" in STYLE_CSS
+        # Target the base .project-chip rule (the one carrying the layout props),
+        # not an unrelated theme override of the same selector.
+        base_idx = STYLE_CSS.find(".project-chip{font-size")
+        assert base_idx != -1, "base .project-chip rule not found"
+        chip_rule = STYLE_CSS[base_idx: STYLE_CSS.find("}", base_idx) + 1]
+        # touch tuning so the native callout/selection doesn't compete with the gesture
+        assert "touch-action:manipulation" in chip_rule
+        assert "user-select:none" in chip_rule
+
+
+class TestQuickCreateMobileDrawer:
+    """The project-chip "+" (quick-create) must close the mobile sidebar drawer.
+
+    On phones the sidebar is a full-screen drawer (`.sidebar.mobile-open`,
+    z-index 200) covering the main chat view. The quick-create button creates
+    the new project conversation but never closed the drawer, so on mobile the
+    tap *looked* like a no-op — the session was created, just hidden underneath.
+    Mirrors `$('btnNewChat').onclick` in boot.js and the #5409 close in
+    `_openSidebarSession`.
+    """
+
+    def _quick_create_block(self):
+        idx = SESSIONS_JS.find("function _attachProjectQuickCreateButton(")
+        assert idx != -1, "project quick-create helper not found in sessions.js"
+        # Function body incl. the full onclick success path (~3K covers it).
+        return SESSIONS_JS[idx: idx + 3000]
+
+    def test_quick_create_success_path_closes_mobile_drawer(self):
+        block = self._quick_create_block()
+        assert "closeMobileSidebar" in block, (
+            "project quick-create + must close the mobile sidebar after "
+            "newSession so the new conversation is visible on phones"
+        )
+        # Guarded call, matching the _openSidebarSession (#5409) convention.
+        assert "typeof closeMobileSidebar==='function'" in block
+
+    def test_quick_create_close_runs_after_sidebar_repaint(self):
+        """The close must sit in the success path after the sidebar repaint —
+        not before newSession (the drawer would reopen over the pending load)
+        and not in the catch branch (failure should keep the drawer open so the
+        user can see the toast and retry)."""
+        block = self._quick_create_block()
+        render_idx = block.find("renderSessionList({deferWhileInteracting:false})")
+        close_idx = block.find("closeMobileSidebar")
+        catch_idx = block.find("catch(err)")
+        assert render_idx != -1, "sidebar repaint call not found in quick-create handler"
+        assert close_idx != -1, "closeMobileSidebar not found in quick-create handler"
+        assert catch_idx != -1, "success-path try/catch not found in quick-create handler"
+        assert close_idx > render_idx, (
+            "closeMobileSidebar must run after the sidebar repaint in the success path"
+        )
+        assert close_idx < catch_idx, (
+            "closeMobileSidebar must stay in the success path (try block) — moving it "
+            "into the catch branch would keep the drawer open over the error toast"
+        )
+

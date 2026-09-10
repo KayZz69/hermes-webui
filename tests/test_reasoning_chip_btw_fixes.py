@@ -61,11 +61,15 @@ class TestReasoningDropdownEscapesComposerLeft:
         assert 'id="composerReasoningDropdown"' in INDEX
 
     def test_dropdown_is_sibling_of_other_composer_dropdowns(self):
-        # The four composer-level dropdowns must appear contiguously — if one
+        # The composer-level dropdowns must appear contiguously — if one
         # of them is nested inside an overflow-hidden container, this would
         # typically split the group.
+        # NOTE (#3177): #profileDropdown was intentionally relocated to document
+        # root so it can be positioned from BOTH the composer chip and the
+        # optional titlebar profile button. It is therefore no longer part of the
+        # composer-footer contiguity group; the check below covers the three
+        # dropdowns that must still sit together in the composer footer.
         positions = [
-            ("profileDropdown", INDEX.find('id="profileDropdown"')),
             ("composerWsDropdown", INDEX.find('id="composerWsDropdown"')),
             ("composerReasoningDropdown", INDEX.find('id="composerReasoningDropdown"')),
             ("composerModelDropdown", INDEX.find('id="composerModelDropdown"')),
@@ -135,16 +139,13 @@ class TestReasoningChipNoneState:
 
     def test_none_and_default_do_not_hide_reasoning_chip(self):
         fn = self.get_apply_reasoning_chip()
+        assert "wrap.style.display='none'" in fn, (
+            "_applyReasoningChip must hide the chip when the active model does "
+            "not support reasoning effort controls"
+        )
         assert "wrap.style.display='';" in fn, (
-            "_applyReasoningChip must show the reasoning chip even for empty/"
-            "default or 'none' effort values"
-        )
-        assert "if(!eff" not in fn and "wrap.style.display='none'" not in fn, (
-            "_applyReasoningChip must not use a truthy guard that hides the "
-            "chip for the valid 'none' state"
-        )
-        assert "wrap.style.display='none'" not in fn, (
-            "the None/default reasoning state should be visible, not hidden"
+            "_applyReasoningChip must show the reasoning chip when the model "
+            "supports reasoning effort controls"
         )
 
     def test_none_and_default_have_visible_labels(self):
@@ -184,8 +185,8 @@ class TestReasoningCommandUpdatesChip:
         )
         assert m, "cmdReasoning not found in commands.js"
         fn = m.group(0)
-        assert "_applyReasoningChip(eff)" in fn, (
-            "cmdReasoning must call _applyReasoningChip(eff) with the "
+        assert "_applyReasoningChip(eff," in fn, (
+            "cmdReasoning must call _applyReasoningChip(eff, st) with the "
             "server-confirmed effort from the /api/reasoning POST response"
         )
 
@@ -343,12 +344,18 @@ class TestResizeHandlerSymmetry:
     def test_resize_repositions_reasoning_dropdown(self):
         # The global resize handler must handle both composerModelDropdown AND
         # composerReasoningDropdown to keep them aligned when the window resizes.
-        m = re.search(
+        handlers = re.findall(
             r"window\.addEventListener\(\s*['\"]resize['\"][\s\S]*?\}\s*\)\s*;",
             UI_JS,
         )
-        assert m, "window resize handler not found in ui.js"
-        handler = m.group(0)
+        handler = next(
+            (
+                block for block in handlers
+                if "composerModelDropdown" in block and "_positionModelDropdown" in block
+            ),
+            None,
+        )
+        assert handler, "composer model dropdown resize handler not found in ui.js"
         assert "composerReasoningDropdown" in handler, (
             "window resize handler must also re-position composerReasoningDropdown "
             "while it's open (symmetric with the existing model-dropdown branch)"

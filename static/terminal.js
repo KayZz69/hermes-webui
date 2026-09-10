@@ -15,6 +15,11 @@ const TERMINAL_UI={
   resizing:false,
   resizeStartY:0,
   resizeStartHeight:0,
+  lastAppliedTheme:null,
+  lastAppliedFontFamily:null,
+  fontFitFrame:null,
+  fontLoadGeneration:0,
+  fontLoadRequest:null,
 };
 
 const TERMINAL_HEIGHT_DEFAULT=260;
@@ -114,8 +119,78 @@ function _terminalTheme(){
   };
 }
 
-function syncComposerTerminalTheme(){
-  if(TERMINAL_UI.term)TERMINAL_UI.term.options.theme=_terminalTheme();
+function _terminalMonoFont(){
+  return _terminalCssVar(
+    '--font-mono',
+    'ui-monospace,"SFMono-Regular","SF Mono",Menlo,Consolas,"Liberation Mono",monospace'
+  );
+}
+
+function _terminalThemesEqual(left,right){
+  if(left===right)return true;
+  if(!left||!right)return false;
+  const leftKeys=Object.keys(left);
+  const rightKeys=Object.keys(right);
+  return leftKeys.length===rightKeys.length&&leftKeys.every(key=>Object.prototype.hasOwnProperty.call(right,key)&&left[key]===right[key]);
+}
+
+function _scheduleTerminalFontFit(term){
+  if(TERMINAL_UI.fontFitFrame!==null)return;
+  TERMINAL_UI.fontFitFrame=requestAnimationFrame(()=>{
+    TERMINAL_UI.fontFitFrame=null;
+    if(TERMINAL_UI.term!==term||!TERMINAL_UI.open||TERMINAL_UI.collapsed)return;
+    _fitTerminal();
+  });
+}
+
+function _watchTerminalFontLoad(term,fontFamily){
+  const request={
+    generation:TERMINAL_UI.fontLoadGeneration+1,
+    term,
+    fontFamily,
+  };
+  TERMINAL_UI.fontLoadGeneration=request.generation;
+  TERMINAL_UI.fontLoadRequest=request;
+  const fontSet=document.fonts;
+  if(!fontSet||typeof fontSet.load!=='function')return;
+  const fontSize=Number(term.options&&term.options.fontSize);
+  const fontShorthand=(Number.isFinite(fontSize)&&fontSize>0?fontSize:13)+'px '+fontFamily;
+  let load;
+  try{
+    load=document.fonts.load(fontShorthand);
+  }catch(_){
+    return;
+  }
+  Promise.resolve(load).then(fontFaces=>{
+    if(!fontFaces||fontFaces.length===0)return;
+    if(TERMINAL_UI.fontLoadRequest!==request
+      ||TERMINAL_UI.fontLoadGeneration!==request.generation
+      ||TERMINAL_UI.term!==term
+      ||!TERMINAL_UI.open
+      ||TERMINAL_UI.collapsed
+      ||TERMINAL_UI.lastAppliedFontFamily!==fontFamily)return;
+    _scheduleTerminalFontFit(term);
+  },()=>{});
+}
+
+function syncComposerTerminalAppearance(forceFontLoad=false){
+  if(!TERMINAL_UI.term)return;
+  const term=TERMINAL_UI.term;
+  const theme=_terminalTheme();
+  const fontFamily=_terminalMonoFont();
+  if(!_terminalThemesEqual(TERMINAL_UI.lastAppliedTheme,theme)){
+    term.options.theme=theme;
+    TERMINAL_UI.lastAppliedTheme={...theme};
+  }
+  const fontFamilyChanged=TERMINAL_UI.lastAppliedFontFamily!==fontFamily;
+  if(fontFamilyChanged){
+    term.options.fontFamily=fontFamily;
+    TERMINAL_UI.lastAppliedFontFamily=fontFamily;
+    _scheduleTerminalFontFit(term);
+  }
+  if(fontFamilyChanged||forceFontLoad){
+    _watchTerminalFontLoad(term,fontFamily);
+  }
 }
 
 function _xtermReady(){
@@ -130,13 +205,15 @@ function _ensureXterm(){
     surface.textContent='Terminal library failed to load. Check network access to cdn.jsdelivr.net.';
     return null;
   }
+  const theme=_terminalTheme();
+  const fontFamily=_terminalMonoFont();
   const term=new window.Terminal({
     cursorBlink:true,
     fontSize:13,
-    fontFamily:'Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+    fontFamily,
     scrollback:1000,
     convertEol:false,
-    theme:_terminalTheme(),
+    theme,
   });
   let fitAddon=null;
   if(window.FitAddon&&typeof window.FitAddon.FitAddon==='function'){
@@ -162,7 +239,10 @@ function _ensureXterm(){
   });
   TERMINAL_UI.term=term;
   TERMINAL_UI.fitAddon=fitAddon;
+  TERMINAL_UI.lastAppliedTheme={...theme};
+  TERMINAL_UI.lastAppliedFontFamily=fontFamily;
   _fitTerminal();
+  _watchTerminalFontLoad(term,fontFamily);
   return term;
 }
 
@@ -346,6 +426,32 @@ function _setTerminalChromeState(state){
   if(dockWorkspace)dockWorkspace.textContent=label;
 }
 
+function syncTerminalBackendState(data){
+  S.terminalRemoteBackend=!!(data&&data.terminal_remote_backend);
+  return S.terminalRemoteBackend;
+}
+
+function _terminalRemoteBackendUnsupportedMessage(){
+  const key=t('terminal_remote_backend_unsupported');
+  return key&&key!=='terminal_remote_backend_unsupported'
+    ? key
+    : 'Embedded terminal is only supported for local terminal backends.';
+}
+
+function _terminalStartErrorMessage(err){
+  if(err&&err.body){
+    try{
+      const payload=JSON.parse(err.body);
+      if(payload&&payload.error==='remote_terminal_backend_unsupported'){
+        S.terminalRemoteBackend=true;
+        syncTerminalButton();
+        return String(payload.message||_terminalRemoteBackendUnsupportedMessage());
+      }
+    }catch(_){}
+  }
+  return err&&err.message?err.message:String(err||'');
+}
+
 function syncTerminalButton(){
   const {toggle}= _terminalEls();
   const currentSid=_terminalSessionId();
@@ -355,10 +461,15 @@ function syncTerminalButton(){
   }
   if(!toggle)return;
   const hasWorkspace=!!(S.session&&S.session.workspace);
-  toggle.disabled=!hasWorkspace;
+  const remoteBackend=!!S.terminalRemoteBackend;
+  toggle.disabled=!hasWorkspace||remoteBackend;
   toggle.classList.toggle('active',TERMINAL_UI.open);
   toggle.setAttribute('aria-pressed',TERMINAL_UI.open?'true':'false');
-  toggle.title=hasWorkspace?(TERMINAL_UI.collapsed?t('terminal_expand'):t('terminal_open_title')):t('terminal_no_workspace_title');
+  toggle.title=!hasWorkspace
+    ? t('terminal_no_workspace_title')
+    : (remoteBackend
+      ? _terminalRemoteBackendUnsupportedMessage()
+      : (TERMINAL_UI.collapsed?t('terminal_expand'):t('terminal_open_title')));
   toggle.setAttribute('aria-label',toggle.title);
 }
 
@@ -370,10 +481,10 @@ function _connectTerminalOutput(){
   const sid=_terminalSessionId();
   if(!sid)return;
   if(TERMINAL_UI.source){
-    try{TERMINAL_UI.source.close();}catch(_){}
+    try{if(TERMINAL_UI.source.readyState!==2)TERMINAL_UI.source.close();}catch(_){}
     TERMINAL_UI.source=null;
   }
-  const url=new URL('api/terminal/output',location.href);
+  const url=new URL('api/terminal/output',document.baseURI||location.href);
   url.searchParams.set('session_id',sid);
   const source=new EventSource(url.href,{withCredentials:true});
   TERMINAL_UI.source=source;
@@ -383,11 +494,12 @@ function _connectTerminalOutput(){
     try{text=(JSON.parse(ev.data)||{}).text||'';}
     catch(_){text=ev.data||'';}
     if(TERMINAL_UI.term&&text)TERMINAL_UI.term.write(text);
+    if(text&&window._terminalAutoExpandOnOutput&&TERMINAL_UI.open&&TERMINAL_UI.collapsed)expandComposerTerminal({focus:false});
   });
   source.addEventListener('terminal_closed',()=>{
     if(TERMINAL_UI.source!==source)return;
     if(TERMINAL_UI.term)TERMINAL_UI.term.writeln('\r\n[terminal closed]\r\n');
-    try{source.close();}catch(_){}
+    try{if(source&&source.readyState!==2)source.close();}catch(_){}
     TERMINAL_UI.source=null;
     setTimeout(()=>closeComposerTerminal(null,{skipApi:true}),260);
   });
@@ -396,8 +508,36 @@ function _connectTerminalOutput(){
     let msg=t('terminal_error');
     try{msg=(JSON.parse(ev.data)||{}).error||msg;}catch(_){}
     if(TERMINAL_UI.term)TERMINAL_UI.term.writeln('\r\n[terminal error] '+msg+'\r\n');
-    try{source.close();}catch(_){}
+    try{if(source&&source.readyState!==2)source.close();}catch(_){}
     TERMINAL_UI.source=null;
+  });
+  // A successful (re)connect clears the notify latch so the NEXT outage notifies
+  // again — "once per outage", not "once per source lifetime". Without this, a
+  // source that errors, auto-reconnects, then drops a second time would stay
+  // silent (guard already true, not CLOSED) — the exact freeze this handler
+  // prevents.
+  source.addEventListener('open',()=>{
+    if(TERMINAL_UI.source!==source)return;
+    source._terminalErrNotified=false;
+  });
+  // Transport-level failures (session expired, gateway killed, network drop)
+  // fire 'error' rather than a terminal_* event; without this the terminal froze
+  // with no feedback and no telemetry. Let the browser auto-reconnect a merely
+  // CONNECTING source (no manual loop/backoff), but surface a permanently CLOSED
+  // one and tear it down so a restart can reconnect. Notify once per outage so a
+  // flapping connection can't flood the pane or telemetry.
+  source.addEventListener('error',()=>{
+    if(TERMINAL_UI.source!==source)return;
+    const closed=source.readyState===EventSource.CLOSED;
+    if(closed||!source._terminalErrNotified){
+      source._terminalErrNotified=true;
+      if(typeof recordClientSSEError==='function')recordClientSSEError('terminal',{ready_state:source?source.readyState:null,reason:'terminal EventSource.onerror'});
+      if(TERMINAL_UI.term)TERMINAL_UI.term.writeln('\r\n[terminal '+(closed?'disconnected':'connection lost, reconnecting…')+']\r\n');
+    }
+    if(closed){
+      try{if(source&&source.readyState!==2)source.close();}catch(_){}
+      TERMINAL_UI.source=null;
+    }
   });
 }
 
@@ -408,16 +548,26 @@ async function _startComposerTerminal(restart=false){
     syncTerminalButton();
     return;
   }
+  if(S.terminalRemoteBackend){
+    showToast(_terminalRemoteBackendUnsupportedMessage(),3200,'warning');
+    syncTerminalButton();
+    return;
+  }
   const term=_ensureXterm();
   if(!term)return;
   _fitTerminal();
   const dims=_terminalDimensions();
-  await api('/api/terminal/start',{method:'POST',body:JSON.stringify({
-    session_id:sid,
-    rows:dims.rows,
-    cols:dims.cols,
-    restart:!!restart,
-  })});
+  try{
+    await api('/api/terminal/start',{method:'POST',body:JSON.stringify({
+      session_id:sid,
+      rows:dims.rows,
+      cols:dims.cols,
+      restart:!!restart,
+    })});
+  }catch(e){
+    e.message=_terminalStartErrorMessage(e);
+    throw e;
+  }
   TERMINAL_UI.sessionId=sid;
   TERMINAL_UI.workspace=S.session&&S.session.workspace||null;
   TERMINAL_UI.typedLine='';
@@ -476,8 +626,9 @@ function collapseComposerTerminal(){
   syncTerminalButton();
 }
 
-function expandComposerTerminal(){
+function expandComposerTerminal(opts){
   if(!TERMINAL_UI.open)return;
+  const focus = !opts || opts.focus !== false;
   const {panel}= _terminalEls();
   const messages=_terminalMessagesEl();
   TERMINAL_UI.collapsed=false;
@@ -490,7 +641,7 @@ function expandComposerTerminal(){
   _resetTerminalHeightForViewport();
   requestAnimationFrame(()=>{
     _fitTerminal();
-    focusComposerTerminalInput();
+    if(focus) focusComposerTerminalInput();
     setTimeout(()=>{
       if(panel)panel.classList.remove('is-expanding-from-dock');
       if(messages)messages.classList.remove('terminal-expanding-from-dock');
@@ -500,12 +651,20 @@ function expandComposerTerminal(){
 }
 
 function _disposeXterm(){
+  TERMINAL_UI.fontLoadGeneration+=1;
+  TERMINAL_UI.fontLoadRequest=null;
+  if(TERMINAL_UI.fontFitFrame!==null){
+    if(typeof cancelAnimationFrame==='function')cancelAnimationFrame(TERMINAL_UI.fontFitFrame);
+    TERMINAL_UI.fontFitFrame=null;
+  }
   if(TERMINAL_UI.term){
     try{TERMINAL_UI.term.dispose();}catch(_){}
   }
   TERMINAL_UI.term=null;
   TERMINAL_UI.fitAddon=null;
   TERMINAL_UI.typedLine='';
+  TERMINAL_UI.lastAppliedTheme=null;
+  TERMINAL_UI.lastAppliedFontFamily=null;
   const {surface}= _terminalEls();
   if(surface)surface.textContent='';
 }
@@ -514,7 +673,7 @@ async function closeComposerTerminal(sessionId,opts){
   opts=opts||{};
   const sid=sessionId||TERMINAL_UI.sessionId||_terminalSessionId();
   if(TERMINAL_UI.source){
-    try{TERMINAL_UI.source.close();}catch(_){}
+    try{if(TERMINAL_UI.source&&TERMINAL_UI.source.readyState!==2)TERMINAL_UI.source.close();}catch(_){}
     TERMINAL_UI.source=null;
   }
   if(sid&&!opts.skipApi){
@@ -545,7 +704,7 @@ async function closeComposerTerminal(sessionId,opts){
 async function restartComposerTerminal(){
   if(!TERMINAL_UI.open||TERMINAL_UI.collapsed)return;
   if(TERMINAL_UI.source){
-    try{TERMINAL_UI.source.close();}catch(_){}
+    try{if(TERMINAL_UI.source&&TERMINAL_UI.source.readyState!==2)TERMINAL_UI.source.close();}catch(_){}
     TERMINAL_UI.source=null;
   }
   if(TERMINAL_UI.term)TERMINAL_UI.term.reset();
@@ -603,9 +762,9 @@ async function _resizeComposerTerminal(){
 }
 
 window.addEventListener('beforeunload',()=>{
-  if(TERMINAL_UI.source)try{TERMINAL_UI.source.close();}catch(_){}
+  if(TERMINAL_UI.source)try{if(TERMINAL_UI.source&&TERMINAL_UI.source.readyState!==2)TERMINAL_UI.source.close();}catch(_){}
   if(TERMINAL_UI.sessionId){
-    const url=new URL('api/terminal/close',location.href).href;
+    const url=new URL('api/terminal/close',document.baseURI||location.href).href;
     const body=JSON.stringify({session_id:TERMINAL_UI.sessionId});
     try{
       navigator.sendBeacon(url,new Blob([body],{type:'application/json'}));
@@ -625,8 +784,29 @@ window.addEventListener('resize',()=>{
 });
 
 if(window.MutationObserver){
-  new MutationObserver(syncComposerTerminalTheme).observe(document.documentElement,{
+  new MutationObserver(()=>syncComposerTerminalAppearance()).observe(document.documentElement,{
     attributes:true,
-    attributeFilter:['class','data-skin'],
+    attributeFilter:['class','data-skin','style'],
   });
+
+  const terminalHead=document.head;
+  if(terminalHead){
+    const terminalHeadStylesheetLoadListener=(event)=>{
+      const target=event && event.target;
+      if(!target||typeof target.tagName!=='string'||target.tagName.toLowerCase()!=='link')return;
+      const rel=typeof target.getAttribute==='function'
+        ? target.getAttribute('rel')
+        : target.rel;
+      if(!String(rel||'').toLowerCase().split(/\s+/).includes('stylesheet'))return;
+      syncComposerTerminalAppearance(true);
+    };
+    terminalHead.addEventListener('load',terminalHeadStylesheetLoadListener,true);
+    new MutationObserver(()=>syncComposerTerminalAppearance(true)).observe(terminalHead,{
+      attributes:true,
+      attributeFilter:['href','media','disabled'],
+      childList:true,
+      subtree:true,
+      characterData:true,
+    });
+  }
 }

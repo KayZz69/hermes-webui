@@ -4,6 +4,43 @@ Thanks for contributing.
 
 Hermes WebUI is intentionally simple to work on: Python on the server, vanilla JS in the browser, no build step, no bundler, no frontend framework. The best pull requests preserve that simplicity while solving a real problem cleanly.
 
+## Before You Start
+
+- Read [`AGENTS.md`](AGENTS.md) if an AI assistant is doing or helping with the
+  change.
+- Read [`docs/GUIDELINES.md`](docs/GUIDELINES.md) — the change guidelines that get a PR
+  merged in one review round instead of several (what "complete and verified" means here).
+- Read [`docs/CONTRACTS.md`](docs/CONTRACTS.md) and any linked contract/RFC for
+  the subsystem you will touch.
+- For UI or UX work, read [`docs/UIUX-GUIDE.md`](docs/UIUX-GUIDE.md)
+  and [`DESIGN.md`](DESIGN.md).
+- For runtime, streaming, recovery, replay, compression, context reconstruction,
+  or session metadata work, start with [`docs/rfcs/README.md`](docs/rfcs/README.md)
+  and the relevant RFC listed there.
+
+Use those documents as review guardrails: keep the change scoped, preserve the
+no-build-step architecture, update docs when behavior changes, put
+release-note-worthy details in the PR body, include UI evidence for UI changes,
+and add tests for behavior changes where practical.
+
+### Contract-affecting PRs
+
+A contract-affecting PR is any change that updates a public contract document,
+an RFC, a contributor guide, a product-semantics test, or behavior that those
+documents already describe. These PRs need an explicit `Contract Routing` section
+in the PR body that names the touched contract family and the evidence used.
+See [`docs/CONTRACTS.md#contract-routing`](docs/CONTRACTS.md#contract-routing)
+for the short routing shape and [`docs/CONTRACTS.md#contract-changes`](docs/CONTRACTS.md#contract-changes)
+for intentional contract changes.
+
+If the PR intentionally changes an existing contract, add a `Contract Change`
+section that states the old rule, the new rule, and why the change is justified.
+Do not silently redefine product behavior by changing tests alone; update the
+corresponding docs in the same PR.
+
+A release batch should call out included contract-affecting PRs separately
+from ordinary fixes, even when the code diff is small and CI is green.
+
 ## Two Paths to a Strong Pull Request
 
 ### Path 1: Small, Focused Changes
@@ -37,10 +74,12 @@ Keep each PR focused. A small related group of fixes is fine. A bug fix plus a C
 
 ### 2. Local Verification
 
-Run the test suite locally:
+Run the test suite locally through the repo runner. It creates/uses a supported
+Python 3.11-3.13 `.venv` and installs missing dev test dependencies, avoiding
+unsupported system interpreters during collection:
 
 ```bash
-pytest tests/ -v --timeout=60
+./scripts/test.sh
 ```
 
 CI also runs this suite on Python `3.11`, `3.12`, and `3.13`.
@@ -58,9 +97,26 @@ There is currently no PR template in this repo, so include the important section
 - Risks / Follow-ups
 - Model Used
 
+Two things reviewers look for specifically in Verification, both detailed in
+[`docs/GUIDELINES.md`](docs/GUIDELINES.md):
+
+- When the issue pins the bug's shape — a session capture, a script, exact steps, or
+  a fenced JSON block / field-level trigger conditions — bind your test to *that* shape
+  rather than a fixture rebuilt from your reading of it, satisfying every condition it
+  names; otherwise the test can pass while the reported bug goes untouched. Reconstruct
+  the shape yourself only when the issue leaves it unpinned, and then say what you assumed.
+- For any claim the repo doesn't own (browser behavior, a provider's API, a registry,
+  an OS convention), name who owns the truth and confirm your proof is one they'd accept.
+  In-page automation proves page behavior, not browser behavior; a mock proves your
+  intent, not the provider's contract.
+
 If the change is user-visible, include screenshots or a short video.
 
-For UI or UX changes, before/after images are required. PRs that change the interface or interaction flow without before/after images will likely be ignored, or closed in a regular maintainer sweep without review.
+If the change is release-note-worthy, include concise release-note wording in
+the PR body. Do not edit `CHANGELOG.md` directly in ordinary contributor PRs;
+the release workflow maintains it through release commits.
+
+For UI or UX changes, before/after images are required. PRs that change the interface or interaction flow without before/after images may not receive meaningful review until that evidence is added.
 
 ### 4. AI Usage Disclosure
 
@@ -84,7 +140,9 @@ Common files:
 - [ROADMAP.md](ROADMAP.md) for shipped features and sprint history
 - [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and design constraints
 - [TESTING.md](TESTING.md) for manual and automated verification guidance
-- [CHANGELOG.md](CHANGELOG.md) when maintainers want release-note-ready entries
+- [CHANGELOG.md](CHANGELOG.md) for release history context. Do not edit it in
+  ordinary contributor PRs; include release-note-ready wording in the PR body
+  so maintainers can carry it into the release workflow.
 
 ## Project-Specific Guidelines
 

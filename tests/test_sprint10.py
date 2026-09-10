@@ -2,6 +2,10 @@
 Sprint 10 Tests: server.py split, cancel endpoint, cron history, tool card polish.
 """
 import json, pathlib, urllib.error, urllib.request, urllib.parse
+from io import BytesIO
+
+from tests.conftest import requires_agent_modules
+
 REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 
 from tests._pytest_port import BASE
@@ -23,6 +27,25 @@ def post(path, body=None):
             return json.loads(r.read()), r.status
     except urllib.error.HTTPError as e:
         return json.loads(e.read()), e.code
+
+
+class CaptureHandler:
+    headers = {}
+
+    def __init__(self):
+        self.status = None
+        self.response_headers = []
+        self.wfile = BytesIO()
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, name, value):
+        self.response_headers.append((name, value))
+
+    def end_headers(self):
+        pass
+
 
 def make_session(created_list):
     d, _ = post("/api/session/new", {})
@@ -104,6 +127,51 @@ def test_crons_output_limit_param(cleanup_test_sessions):
     # 404 or 200 with empty -- both acceptable for nonexistent job
     assert status in (200, 404)
 
+
+@requires_agent_modules
+def test_crons_output_rejects_traversal_job_id(monkeypatch, tmp_path):
+    """Cron output listing must not read markdown files outside OUTPUT_DIR."""
+    from api.routes import _handle_cron_output
+    import cron.jobs
+
+    output_dir = tmp_path / "cron" / "output"
+    secret_dir = tmp_path / "memories"
+    output_dir.mkdir(parents=True)
+    secret_dir.mkdir()
+    (secret_dir / "MEMORY.md").write_text("SECRET_MARKDOWN_TOKEN\n", encoding="utf-8")
+    monkeypatch.setattr(cron.jobs, "OUTPUT_DIR", output_dir)
+
+    handler = CaptureHandler()
+    parsed = urllib.parse.urlparse("/api/crons/output?job_id=../../memories&limit=5")
+    _handle_cron_output(handler, parsed)
+
+    body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+    assert handler.status == 400
+    assert body == {"error": "invalid job_id"}
+    assert "SECRET_MARKDOWN_TOKEN" not in handler.wfile.getvalue().decode("utf-8")
+
+
+@requires_agent_modules
+def test_crons_output_still_returns_valid_job_outputs(monkeypatch, tmp_path):
+    """Valid job ids still list recent markdown output content."""
+    from api.routes import _handle_cron_output
+    import cron.jobs
+
+    output_dir = tmp_path / "cron" / "output"
+    job_dir = output_dir / "job_123"
+    job_dir.mkdir(parents=True)
+    (job_dir / "run.md").write_text("# Cron Job\n\n## Response\nexpected output\n", encoding="utf-8")
+    monkeypatch.setattr(cron.jobs, "OUTPUT_DIR", output_dir)
+
+    handler = CaptureHandler()
+    parsed = urllib.parse.urlparse("/api/crons/output?job_id=job_123&limit=5")
+    _handle_cron_output(handler, parsed)
+
+    body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+    assert handler.status == 200
+    assert body["job_id"] == "job_123"
+    assert body["outputs"] == [{"filename": "run.md", "content": "# Cron Job\n\n## Response\nexpected output\n"}]
+
 def test_cron_history_button_in_panels_js(cleanup_test_sessions):
     src, _ = get_text("/static/panels.js")
     # After the main-view refactor, cron runs load inline into the detail card
@@ -114,6 +182,74 @@ def test_cron_history_button_in_panels_js(cleanup_test_sessions):
 def test_cron_output_snippet_helper(cleanup_test_sessions):
     src, _ = get_text("/static/panels.js")
     assert "_cronOutputSnippet" in src
+
+
+def test_cron_output_usage_metadata_parses_optional_fields(cleanup_test_sessions):
+    from api.routes import _cron_output_usage_metadata
+
+    content = "\n".join([
+        "# Cron Job: Nightly",
+        "**Model:** openai-codex/gpt-5.5",
+        "**Tokens:** 12,345 in / 678 out",
+        "**Estimated cost:** $0.0123 (estimated)",
+        "**Duration:** 42.5s",
+        "",
+        "## Response",
+        "Done",
+    ])
+
+    usage = _cron_output_usage_metadata(content)
+
+    assert usage["model"] == "openai-codex/gpt-5.5"
+    assert usage["input_tokens"] == 12345
+    assert usage["output_tokens"] == 678
+    assert usage["total_tokens"] == 13023
+    assert usage["estimated_cost_usd"] == 0.0123
+    assert usage["duration_seconds"] == 42.5
+
+
+def test_cron_output_usage_strip_render_hook(cleanup_test_sessions):
+    src, _ = get_text("/static/panels.js")
+    css, _ = get_text("/static/style.css")
+
+    assert "_formatCronRunUsageStrip(run.usage)" in src
+    assert "_formatCronRunUsageStrip(data.usage)" in src
+    assert "cron-run-usage-strip" in src
+    assert ".cron-run-usage-strip" in css
+
+
+def test_cron_output_window_preserves_response_after_large_prompt(cleanup_test_sessions):
+    """Large skill dumps before ## Response must not hide the useful output."""
+    from api.routes import _cron_output_content_window
+
+    content = (
+        "Job metadata\n"
+        "## Prompt\n"
+        + ("skill dump\n" * 1200)
+        + "user prompt\n"
+        "## Response\n"
+        "actual useful cron result\n"
+    )
+
+    window = _cron_output_content_window(content, limit=8000)
+
+    assert len(window) <= 8000
+    assert "## Response" in window
+    assert "actual useful cron result" in window
+    assert "Job metadata" in window
+
+
+def test_cron_output_window_without_response_uses_tail(cleanup_test_sessions):
+    """Without a response marker, keep the newest tail rather than old prompt text."""
+    from api.routes import _cron_output_content_window
+
+    content = "old prompt\n" + ("x" * 9000) + "tail result"
+
+    window = _cron_output_content_window(content, limit=8000)
+
+    assert len(window) == 8000
+    assert window.endswith("tail result")
+    assert "old prompt" not in window
 
 # ── Tool card polish ───────────────────────────────────────────────────────
 

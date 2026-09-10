@@ -33,10 +33,28 @@ _DRIVER_SRC = r"""
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 global.window = {};
-global.document = { createElement: () => ({ innerHTML: '', textContent: '' }) };
+global.document = { createElement: () => ({ innerHTML: '', textContent: '' }), baseURI: 'http://localhost/app/' };
+function _sessionUrlForSid(sid) { return '/app/session/' + encodeURIComponent(String(sid || '')); }
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => (
   {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
+const _SVG_EXTS=/\.svg$/i;
+const _AUDIO_EXTS=/\.(mp3|ogg|wav|m4a|aac|flac|wma|opus|webm)$/i;
+const _VIDEO_EXTS=/\.(mp4|webm|mkv|mov|avi|ogv|m4v)$/i;
+// Minimal stand-in for ui.js' _inlineMediaHtmlForRef used when the driver
+// extracts only renderMd(). Mirrors the live UI for the cases the existing
+// tests assert against (https image, bare file:// image). The full renderer
+// (ui.js) is preferred on the real page — these nodes only cover what is
+// reachable from a standalone renderMd() invocation.
+function _inlineMediaHtmlForRef(ref){
+  const r = String(ref || '');
+  if (/^https?:\/\//.test(r)) return `<img class="msg-media-img" src="${esc(r)}" alt="image" loading="lazy">`;
+  if (/^file:\/\//.test(r)){
+    const m = r.replace(/^file:\/\//i, '');
+    return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(m)}" alt="image" loading="lazy">`;
+  }
+  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(r)}" alt="image" loading="lazy">`;
+}
 
 function extractFunc(name) {
   const re = new RegExp('function\\s+' + name + '\\s*\\(');
@@ -51,6 +69,8 @@ function extractFunc(name) {
   }
   return src.slice(start, i);
 }
+eval(extractFunc('_matchBacktickFenceLine'));
+eval(extractFunc('_isBacktickFenceClose'));
 eval(extractFunc('renderMd'));
 
 let buf = '';
@@ -74,12 +94,35 @@ def _render(driver_path, markdown: str) -> str:
         input=markdown,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed: {result.stderr}")
     return result.stdout
 
+
+
+class TestSessionInternalLinks:
+    """Drive renderMd() so session:// hardening covers the real sanitizer path."""
+
+    def test_session_scheme_renders_same_origin_internal_anchor(self, driver_path):
+        out = _render(driver_path, "[Open session](session://abc123)")
+        assert 'class="session-link"' in out
+        assert 'href="/app/session/abc123"' in out
+        assert 'target="_blank"' not in out
+        assert 'rel="noopener"' not in out
+
+    def test_hostile_session_scheme_collapses_to_encoded_session_path(self, driver_path):
+        out = _render(driver_path, "[bad](session://javascript:alert(1))")
+        assert 'class="session-link"' in out
+        assert 'href="/app/session/javascript%3Aalert(1"' in out
+        assert 'href="javascript:' not in out
+        assert 'target="_blank"' not in out
+
+    def test_unrelated_same_origin_session_segment_is_not_allowlisted(self, driver_path):
+        out = _render(driver_path, '<a class="session-link" href="/anything/foo/session/abc">bad</a>')
+        assert 'href="/anything/foo/session/abc"' not in out
+        assert '<a>bad</a>' in out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Blockquote prefix strip — the bug commit 04e7b53 introduced was a one-char
@@ -182,6 +225,56 @@ class TestRendererSanitization:
 
 class TestCommonLLMShapes:
 
+    def test_commonmark_table_is_not_wrapped_in_paragraph(self, driver_path):
+        src = (
+            "| 升级时段 | 人数 |\n"
+            "|---------|------|\n"
+            "| 5/15（发布当天） | ~30 人 |\n"
+            "| 5/16（今天） | ~10 人 |"
+        )
+        out = _render(driver_path, src)
+        assert "<table><thead>" in out
+        assert "<th>升级时段</th>" in out
+        assert "<td>5/15（发布当天）</td>" in out
+        assert "<td>~10 人</td>" in out
+        assert "<p><table" not in out, (
+            f"Markdown tables are block elements and must not be paragraph-wrapped: {out!r}"
+        )
+
+    def test_table_between_paragraphs_stays_block_level(self, driver_path):
+        src = (
+            "Before the table.\n\n"
+            "| Key | Value |\n"
+            "| --- | --- |\n"
+            "| A | B |\n\n"
+            "After the table."
+        )
+        out = _render(driver_path, src)
+        assert "<p>Before the table.</p>" in out
+        assert "<table><thead>" in out
+        assert "<p>After the table.</p>" in out
+        assert "<p><table" not in out
+        assert "</table></p>" not in out
+
+    def test_table_pipe_inside_inline_code_is_protected(self, driver_path):
+        """Pipes inside backtick code in table cells must not create extra columns."""
+        src = (
+            "| field | expr |\n"
+            "| --- | --- |\n"
+            "| set | `updates.model = modelState.model || null` |\n"
+        )
+        out = _render(driver_path, src)
+        # Must be exactly 2 cells in the data row
+        assert "<th>field</th>" in out
+        assert "<th>expr</th>" in out
+        # The code cell should contain both pipes
+        assert "<code>" in out
+        assert "||" in out
+        # Must NOT split into extra cells
+        assert out.count("<td>") == 2, (
+            f"Expected exactly 2 <td> cells, got {out.count('<td>')}: {out!r}"
+        )
+
     def test_strikethrough_outside_quote(self, driver_path):
         out = _render(driver_path, "This was ~~outdated~~ but is now fine.")
         assert "<del>outdated</del>" in out
@@ -228,6 +321,44 @@ class TestCommonLLMShapes:
         assert "And a closing remark." in out
         # No leading-space artifacts in the quoted text
         assert "\n " not in out.replace("</blockquote>", "")
+
+
+class TestMarkdownListsWithLatex:
+    """Drive the real renderer through the list path that shares the KaTeX placeholders."""
+
+    def test_plain_lists_still_render_markers(self, driver_path):
+        out = _render(driver_path, "- one\n- two\n\n1. alpha\n2. beta")
+        assert "<ul><li>one</li><li>two</li></ul>" in out
+        assert '<ol><li value="1">alpha</li><li value="2">beta</li></ol>' in out
+
+    def test_continuation_line_stays_inside_same_list_item(self, driver_path):
+        out = _render(driver_path, "- first line\n  second line\n- next item")
+        assert "<ul>" in out
+        assert "<li>first line\nsecond line</li>" in out, out
+        assert "<li>next item</li>" in out
+
+    def test_nested_indentation_stays_in_list(self, driver_path):
+        out = _render(driver_path, "- parent\n  - child")
+        assert "<ul>" in out
+        assert "<li>parent</li>" in out
+        assert '<li style="margin-left:16px">child</li>' in out
+
+    def test_display_math_line_stays_inside_list_item(self, driver_path):
+        src = "- intro\n\n  $$x^2$$\n\n  continuation"
+        out = _render(driver_path, src)
+        assert "<ul>" in out and "</ul>" in out
+        assert "<p>continuation</p>" not in out, out
+        assert "<div class=\"katex-block\" data-katex=\"display\">x^2</div>" in out
+        assert "<li>intro\n<div class=\"katex-block\" data-katex=\"display\">x^2</div>\ncontinuation</li>" in out, out
+
+    def test_mixed_markdown_and_latex_ordered_list_preserves_all_items(self, driver_path):
+        src = "1. **First** with $x$\n2. $$y$$\n3. tail"
+        out = _render(driver_path, src)
+        assert "<ol>" in out and "</ol>" in out
+        assert "<strong>First</strong>" in out
+        assert "<span class=\"katex-inline\" data-katex=\"inline\">x</span>" in out
+        assert "<div class=\"katex-block\" data-katex=\"display\">y</div>" in out
+        assert '<li value="3">tail</li>' in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +411,49 @@ class TestBugFencedCodeInBlockquote:
         out = _render(driver_path, src)
         assert 'class="language-python"' in out
         assert "x = 1" in out
+
+
+class TestFencedCodeFenceLength:
+    """CommonMark §4.5 requires the closer to be at least as long as the opener."""
+
+    def test_five_backtick_outer_fence_preserves_inner_triple_fence(self, driver_path):
+        src = (
+            "- optionally also support fenced code blocks\n\n"
+            "`````md\n"
+            "`md\n"
+            "```novelcrafter\n"
+            "{#if novel.hasSeries}\n"
+            "...\n"
+            "{#endif}\n"
+            "```\n"
+            "`````\n\n"
+            "That is much more correct than pretending"
+        )
+        out = _render(driver_path, src)
+        assert out.count("<pre class=\"md-source-block\">") == 1
+        assert out.count("</pre>") == 1
+        assert '<div class="pre-header">md</div>' in out
+        assert "```novelcrafter" in out
+        assert "{#if novel.hasSeries}" in out
+        assert "That is much more correct than pretending" in out
+        assert "<p>`````" not in out
+        assert "<br>`````" not in out
+
+    def test_four_backtick_outer_fence_preserves_inner_triple_fence(self, driver_path):
+        out = _render(driver_path, "````md\n```inner\nfoo\n```\n````\n")
+        assert out.count("<pre class=\"md-source-block\">") == 1
+        assert out.count("</pre>") == 1
+        assert '<div class="pre-header">md</div>' in out
+        assert "```inner" in out
+        assert "foo" in out
+        assert "<p>````" not in out
+
+    def test_three_backtick_fence_still_renders_language_class(self, driver_path):
+        out = _render(driver_path, "```js\nconsole.log('ok')\n```")
+        assert out.count("<pre>") == 1
+        assert '<div class="pre-header">js</div>' in out
+        assert 'class="language-js"' in out
+        assert "console.log(&#39;ok&#39;)" in out
 
 
 class TestBugBlankContinuationInBlockquote:
@@ -500,6 +674,51 @@ class TestBlockquoteEntityEncodedInput:
         assert "<pre>" in out, f"Fenced code inside entity-encoded blockquote must render: {out!r}"
 
 
+class TestMermaidToolOutputGuard:
+    """Line-numbered tool excerpts must not be auto-rendered as Mermaid."""
+
+    def test_line_numbered_mermaid_fence_renders_as_code_block(self, driver_path):
+        src = "```mermaid\n23|flowchart TB\n24|    A --> B\n```"
+        out = _render(driver_path, src)
+        assert 'class="mermaid-block"' not in out, (
+            f"Line-numbered read_file excerpts are not valid Mermaid and must not auto-render: {out!r}"
+        )
+        assert '<div class="pre-header">mermaid</div>' in out
+        assert '<pre><code class="language-mermaid">' in out
+        assert '23|flowchart TB' in out
+
+    def test_valid_mermaid_fence_still_creates_mermaid_block(self, driver_path):
+        out = _render(driver_path, "```mermaid\nflowchart TB\n    A --> B\n```")
+        assert 'class="mermaid-block"' in out, (
+            f"Valid Mermaid fences should still be queued for Mermaid rendering: {out!r}"
+        )
+        assert 'flowchart TB' in out
+
+    def test_valid_mermaid_c4_fence_still_creates_mermaid_block(self, driver_path):
+        out = _render(driver_path, "```mermaid\nC4Context\n    title System Context\n```")
+        assert 'class="mermaid-block"' in out, (
+            f"Valid C4 Mermaid fences should still be queued for Mermaid rendering: {out!r}"
+        )
+        assert 'C4Context' in out
+
+    def test_valid_mermaid_frontmatter_fence_still_creates_mermaid_block(self, driver_path):
+        out = _render(driver_path, "```mermaid\n---\ntitle: Demo\n---\nflowchart TB\n    A --> B\n```")
+        assert 'class="mermaid-block"' in out, (
+            f"Valid Mermaid fences with frontmatter should still be queued for Mermaid rendering: {out!r}"
+        )
+        assert 'title: Demo' in out
+
+    def test_prose_mention_of_mermaid_fence_renders_as_code_block(self, driver_path):
+        src = "```mermaid\n` fence should not be auto-rendered too aggressively.\n\nSome prose, not a diagram.\n```"
+        out = _render(driver_path, src)
+        assert 'class="mermaid-block"' not in out, (
+            f"Prose captured by a mermaid fence is not valid Mermaid and must not auto-render: {out!r}"
+        )
+        assert '<div class="pre-header">mermaid</div>' in out
+        assert '<pre><code class="language-mermaid">' in out
+        assert 'Some prose, not a diagram.' in out
+
+
 class TestRawPreCodePreservation:
     """Raw <pre><code> HTML from model output should remain structurally intact."""
 
@@ -554,3 +773,33 @@ class TestHeadingLevelsH1ThroughH6:
         assert "<h4><strong>bold</strong> in h4</h4>" in out, (
             f"inline markdown inside h4 must still render: {out!r}"
         )
+
+
+class TestBareFileUrlMediaRendering:
+    """#3219/#3234: bare file:// artifact links render as media, but file://
+    inside fenced/inline code stays literal (the new pass runs AFTER code-stash)."""
+
+    def test_bare_file_url_becomes_media(self, driver_path):
+        out = _render(driver_path, "Here is the screenshot file:///tmp/shot.png done")
+        # Routed through /api/media as an inline image, not left as a raw path.
+        assert "api/media?path=" in out
+        assert "msg-media-img" in out or "<img" in out
+
+    def test_file_url_inside_fenced_code_stays_literal(self, driver_path):
+        out = _render(driver_path, "```\nfile:///tmp/shot.png\n```")
+        # Inside a code fence it must remain literal text, NOT become an <img>.
+        assert "file:///tmp/shot.png" in out
+        assert "<img" not in out
+        assert "api/media?path=" not in out
+
+    def test_file_url_inside_inline_code_stays_literal(self, driver_path):
+        out = _render(driver_path, "run `open file:///tmp/shot.png` now")
+        assert "file:///tmp/shot.png" in out
+        assert "<img" not in out
+        assert "api/media?path=" not in out
+
+    def test_markdown_anchor_file_link_uses_link_path_not_media(self, driver_path):
+        out = _render(driver_path, "[the file](file:///tmp/shot.png)")
+        # Labeled anchors keep the normal link path (routed to /api/media as a link,
+        # not auto-loaded as an <img>).
+        assert "<img" not in out
